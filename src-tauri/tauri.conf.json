@@ -13,9 +13,29 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQzNTE3RDE3NjE2RkFBRDcKUldUWHFtOWhGMzFSMDVsbnk5WDhsenVQcTM0aDdhOXM5ZFR4YXl3UnhOTDdxZ1NVTGJtVXQwV3QK",
+      "endpoints": [
+        "https://github.com/ColdSand803/dsh-desktop/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "publisher": "ColdSand803",
+    "copyright": "Copyright © 2026 ColdSand803",
+    "shortDescription": "DeepSeek Harness 桌面客户端",
+    "longDescription": "把 dsh web 包成原生 Windows 应用：托盘常驻、标题栏跟随主题、退出时清理后端进程树。",
+    "homepage": "https://github.com/ColdSand803/dsh-desktop",
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "installMode": "currentUser"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Default capability: allow the main window to emit theme events to the Rust host",
   "windows": ["main"],
-  "permissions": ["core:default", "core:event:default"]
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "updater:default",
+    "dialog:default"
+  ]
 }

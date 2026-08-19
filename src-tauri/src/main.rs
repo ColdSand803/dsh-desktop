@@ -31,8 +31,8 @@ struct Backend(Mutex<Option<Child>>);
 #[cfg(windows)]
 fn theme_titlebar(window: &tauri::WebviewWindow, dark: bool) {
     use windows_sys::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
-        DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
     };
 
     let hwnd = match window.hwnd() {
@@ -98,23 +98,43 @@ const THEME_WATCH_JS: &str = r#"
     } catch (e) {}
     return true;
   }
+  var eventBroken = false; // latched once we learn the Tauri bridge is unusable
+  var lastMarked = null;   // theme currently encoded into document.title
+
+  function markTitle(dark) {
+    // Fallback channel: encode the theme into document.title. The host polls
+    // it, applies the theme, then strips the marker back off. Only rewrite on
+    // an actual change, otherwise we fight the host for the title every tick.
+    if (lastMarked === dark) return;
+    lastMarked = dark;
+    try {
+      var t = document.title.replace(/^\[dsh-(dark|light)\]/, '');
+      document.title = (dark ? '[dsh-dark]' : '[dsh-light]') + (t || 'DSH Desktop');
+    } catch (e) {}
+  }
+
   function report() {
     var dark = getDark();
-    try {
-      // Primary channel: Tauri event (works when __TAURI__ is injected).
-      if (window.__TAURI__ && window.__TAURI__.event) {
-        window.__TAURI__.event.emit('dsh-theme', { dark: dark });
-        return;
+    if (!eventBroken) {
+      try {
+        // Primary channel: Tauri event. Only reaches the host if a capability
+        // declares remote.urls for this origin (capabilities/remote-theme.json).
+        var p = window.__TAURI__ && window.__TAURI__.event &&
+          window.__TAURI__.event.emit('dsh-theme', { dark: dark });
+        if (p) {
+          // emit() is async, so a capability rejection lands in the promise --
+          // not as a synchronous throw. Latch the fallback when that happens.
+          if (p.catch) {
+            p.catch(function () { eventBroken = true; markTitle(dark); });
+          }
+          return;
+        }
+        eventBroken = true; // no bridge injected on this page at all
+      } catch (e) {
+        eventBroken = true;
       }
-    } catch (e) {}
-    try {
-      // Fallback channel: encode the theme into the title, the host polls it.
-      var prefix = dark ? '[dsh-dark]' : '[dsh-light]';
-      var t = document.title;
-      if (t.indexOf('[dsh-') !== 0) {
-        document.title = prefix + (t || 'DSH Desktop');
-      }
-    } catch (e) {}
+    }
+    markTitle(dark);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', report);
@@ -132,6 +152,8 @@ const THEME_WATCH_JS: &str = r#"
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Second launch: focus the existing window (show it first in case
             // it was hidden to the tray).
@@ -148,18 +170,15 @@ fn main() {
             // Create the main window at runtime so we can inject the theme
             // watcher script; it starts on the local splash page and gets
             // navigated to the backend URL below once it reports ready.
-            let window = WebviewWindowBuilder::new(
-                &handle,
-                "main",
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("DSH Desktop")
-            .inner_size(1280.0, 840.0)
-            .min_inner_size(800.0, 600.0)
-            .center()
-            .initialization_script(THEME_WATCH_JS)
-            .build()
-            .map_err(|e| format!("failed to create main window: {e}"))?;
+            let window =
+                WebviewWindowBuilder::new(&handle, "main", WebviewUrl::App("index.html".into()))
+                    .title("DSH Desktop")
+                    .inner_size(1280.0, 840.0)
+                    .min_inner_size(800.0, 600.0)
+                    .center()
+                    .initialization_script(THEME_WATCH_JS)
+                    .build()
+                    .map_err(|e| format!("failed to create main window: {e}"))?;
 
             // React to theme changes coming from the web page (dark/light).
             let theme_handle = handle.clone();
@@ -183,126 +202,39 @@ fn main() {
             // event bridge is unavailable on the navigated page. Poll it so the
             // title bar follows the page theme on all platforms.
             let title_window = window.clone();
-            std::thread::spawn(move || {
-                let mut last: Option<bool> = None;
-                loop {
-                    let current = title_window.title().ok().and_then(|t| {
-                        if t.starts_with("[dsh-dark]") {
-                            Some(true)
-                        } else if t.starts_with("[dsh-light]") {
-                            Some(false)
-                        } else {
-                            None
-                        }
-                    });
-                    if current.is_some() && current != last {
-                        last = current;
-                        #[cfg(windows)]
-                        theme_titlebar(&title_window, current.unwrap_or(true));
-                    }
-                    std::thread::sleep(Duration::from_millis(800));
+            std::thread::spawn(move || loop {
+                let title = title_window.title().unwrap_or_default();
+                let marker = if title.starts_with("[dsh-dark]") {
+                    Some((true, "[dsh-dark]"))
+                } else if title.starts_with("[dsh-light]") {
+                    Some((false, "[dsh-light]"))
+                } else {
+                    None
+                };
+                if let Some((dark, prefix)) = marker {
+                    #[cfg(windows)]
+                    theme_titlebar(&title_window, dark);
+                    // Strip the marker so the user never sees it in the title
+                    // bar or taskbar. The injected script only re-marks on an
+                    // actual theme change, so this settles instead of looping.
+                    let _ = title_window.set_title(title.trim_start_matches(prefix));
                 }
+                std::thread::sleep(Duration::from_millis(800));
             });
 
-            // If a dsh web is already serving on the probe port (e.g. the
-            // browser tab's instance), reuse it instead of launching our own.
-            // This avoids the task-board single-instance lock colliding with
-            // the browser instance. We don't own that backend, so Backend(None):
-            // exiting the desktop app must not kill the browser's dsh.
-            if let Some(existing) = probe_existing_web() {
-                app.manage(Backend(Mutex::new(None)));
-                if let Ok(parsed) = Url::parse(&existing) {
-                    let _ = window.navigate(parsed);
-                }
-                return Ok(());
-            }
-
-            let mut spawned = spawn_backend()
-                .map_err(|e| format!("failed to start `dsh web`: {e}"))?;
-            let stderr = spawned.stderr.take();
-            let log_file = backend_log_path(&handle)?;
-            let (url_tx, url_rx) = mpsc::channel::<String>();
-
-            app.manage(Backend(Mutex::new(Some(spawned.child))));
-
-            // Reader thread: keeps stdout + stderr pipes open for the backend's
-            // whole lifetime (dropping them early could EPIPE-crash node), and
-            // forwards the first `dsh web: http://...` line to the main thread.
-            let navigator = handle.clone();
-            let log_path = log_file.clone();
+            // Probing, spawning and waiting for the backend URL can take tens
+            // of seconds, so none of it may happen here: `setup` runs to
+            // completion *before* `run()` starts the event loop, so blocking
+            // would leave the native window unable to pump messages -- Windows
+            // greys it out as unresponsive, the splash page freezes and tray
+            // clicks queue up unhandled. Hand it all to a worker thread.
+            let boot = handle.clone();
             std::thread::spawn(move || {
-                let mut stdout = spawned.reader;
-                let stderr = stderr.map(BufReader::new);
-                let mut sent = false;
-
-                // stderr -> log file logger
-                if let Some(err) = stderr {
-                    std::thread::spawn(move || {
-                        use std::io::Write;
-                        let file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&log_path);
-                        if let Ok(mut file) = file {
-                            let mut line = String::new();
-                            let mut r = err;
-                            loop {
-                                line.clear();
-                                match r.read_line(&mut line) {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(_) => {
-                                        let _ = writeln!(file, "[dsh] {}", line.trim_end());
-                                        let _ = file.flush();
-                                    }
-                                }
-                            }
-                        }
-                    });
+                if let Err(e) = boot_backend(&boot) {
+                    eprintln!("dsh backend failed: {e}");
+                    report_boot_failure(&boot, &e);
                 }
-
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match stdout.read_line(&mut line) {
-                        Ok(0) | Err(_) => break, // backend exited
-                        Ok(_) => {
-                            if let Some(url) = extract_url(&line) {
-                                if !sent {
-                                    sent = true;
-                                    let _ = url_tx.send(url);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Backend exited: notify the main thread so it can act
-                // (navigate on success was already handled; on failure quit).
-                let _ = url_tx.send(String::new());
             });
-
-            // Wait (bounded) for the backend URL, then navigate the window.
-            match url_rx.recv_timeout(Duration::from_secs(90)) {
-                Ok(url) if !url.is_empty() => {
-                    if let Some(window) = navigator.get_webview_window("main") {
-                        match Url::parse(&url) {
-                            Ok(parsed) => {
-                                let _ = window.navigate(parsed);
-                            }
-                            Err(e) => eprintln!("bad backend URL {url:?}: {e}"),
-                        }
-                    }
-                    // When the backend later exits on its own, quit the app so the
-                    // window does not sit on a dead page.
-                    std::thread::spawn(move || {
-                        let _ = url_rx.recv();
-                        let _ = navigator.exit(0);
-                    });
-                }
-                _ => {
-                    eprintln!("dsh backend never became ready (see log: {})", log_file.display());
-                    let _ = navigator.exit(1);
-                }
-            }
 
             Ok(())
         })
@@ -323,7 +255,15 @@ fn main() {
             }
             RunEvent::Exit => {
                 if let Some(state) = app_handle.try_state::<Backend>() {
-                    if let Some(mut child) = state.0.lock().unwrap().take() {
+                    // Recover from a poisoned lock rather than unwrapping: if
+                    // any thread panicked while holding it, that must not stop
+                    // us from reaping the backend. The Option<Child> behind it
+                    // is still perfectly valid.
+                    let mut guard = match state.0.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Some(mut child) = guard.take() {
                         kill_process_tree(child.id());
                         let _ = child.kill();
                         let _ = child.wait();
@@ -337,8 +277,9 @@ fn main() {
 /// Tray icon (DeepSeek whale) with a menu: show window / quit.
 fn setup_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示 DSH", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "update", "检查更新", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &update, &quit])?;
 
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
 
@@ -354,6 +295,10 @@ fn setup_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()>
                     let _ = window.unminimize();
                     let _ = window.set_focus();
                 }
+            }
+            "update" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move { check_for_update(app).await });
             }
             "quit" => app.exit(0),
             _ => {}
@@ -378,6 +323,242 @@ fn setup_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()>
     Ok(())
 }
 
+/// Surface a boot failure on the splash page instead of quitting. The window
+/// has not navigated yet, so the splash is still live and can render the reason
+/// -- previously the app called exit(1) here and the window just vanished,
+/// leaving the user nothing to act on. Quitting is left to the tray menu.
+fn report_boot_failure(handle: &tauri::AppHandle, error: &str) {
+    let log_hint = backend_log_path(handle)
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let Some(window) = handle.get_webview_window("main") else {
+        return;
+    };
+    // serde_json quotes and escapes, so the message cannot break out of the
+    // call even though it carries paths and backslashes.
+    let js = format!(
+        "window.__dshBootError && window.__dshBootError({}, {})",
+        serde_json::to_string(error).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&log_hint).unwrap_or_else(|_| "\"\"".into()),
+    );
+    let _ = window.show();
+    // A failure can land before the splash page has finished loading -- with
+    // `dsh` missing from PATH, `cmd /C` exits in milliseconds. eval() cannot
+    // report whether the handler existed yet, so just repeat for a couple of
+    // seconds; __dshBootError is idempotent.
+    for attempt in 0..6 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(350));
+        }
+        let _ = window.eval(js.as_str());
+    }
+}
+
+/// Bring the backend up and point the window at it. Runs on a worker thread --
+/// every step here can block for seconds, which must never happen on the thread
+/// that owns the event loop. Returns Err only when the GUI never became
+/// reachable, in which case the caller quits the app.
+fn boot_backend(handle: &tauri::AppHandle) -> Result<(), String> {
+    // If a dsh web is already serving on the probe port (e.g. the browser tab's
+    // instance), reuse it instead of launching our own. This avoids the
+    // task-board single-instance lock colliding with the browser instance. We
+    // don't own that backend, so Backend(None): exiting the desktop app must
+    // not kill the browser's dsh.
+    if let Some(existing) = probe_existing_web() {
+        handle.manage(Backend(Mutex::new(None)));
+        let url = Url::parse(&existing).map_err(|e| format!("bad probe URL: {e}"))?;
+        if let Some(window) = handle.get_webview_window("main") {
+            let _ = window.navigate(url);
+        }
+        return Ok(());
+    }
+
+    let mut spawned = spawn_backend().map_err(|e| format!("failed to start `dsh web`: {e}"))?;
+    let stderr = spawned.stderr.take();
+    let log_file = backend_log_path(handle).map_err(|e| format!("log path: {e}"))?;
+    let logger = spawn_logger(log_file.clone());
+    let (url_tx, url_rx) = mpsc::channel::<String>();
+
+    // Tie the child to a job object so the whole `dsh web` tree (node, and any
+    // cloudflared helper it spawns) dies with us even on paths where the
+    // RunEvent::Exit cleanup never runs: panic, Task Manager kill, logoff.
+    #[cfg(windows)]
+    confine_to_job(&spawned.child);
+
+    handle.manage(Backend(Mutex::new(Some(spawned.child))));
+
+    // Reader thread: keeps stdout + stderr pipes open for the backend's whole
+    // lifetime (dropping them early could EPIPE-crash node), and forwards the
+    // first `dsh web: http://...` line back here.
+    std::thread::spawn(move || {
+        let mut stdout = spawned.reader;
+        let mut sent = false;
+
+        // stderr on its own thread: a quiet pipe must never stall the other.
+        if let Some(mut err) = stderr.map(BufReader::new) {
+            let log = logger.clone();
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match err.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let _ = log.send(format!("[err] {}", line.trim_end()));
+                        }
+                    }
+                }
+            });
+        }
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // backend exited
+                Ok(_) => {
+                    // Log stdout as well. It used to be parsed for the URL and
+                    // then dropped, so a boot that failed without touching
+                    // stderr left an empty log -- the very log the README sends
+                    // users to for the reason.
+                    let _ = logger.send(format!("[out] {}", line.trim_end()));
+                    if !sent {
+                        if let Some(url) = extract_url(&line) {
+                            sent = true;
+                            let _ = url_tx.send(url);
+                        }
+                    }
+                }
+            }
+        }
+        // Backend exited: an empty string tells the waiter to give up / quit.
+        let _ = url_tx.send(String::new());
+    });
+
+    // Wait (bounded) for the backend URL, then navigate the window.
+    let url = match url_rx.recv_timeout(Duration::from_secs(90)) {
+        Ok(url) if !url.is_empty() => url,
+        _ => {
+            return Err(format!(
+                "dsh backend never became ready (see log: {})",
+                log_file.display()
+            ))
+        }
+    };
+    let parsed = Url::parse(&url).map_err(|e| format!("bad backend URL {url:?}: {e}"))?;
+    if let Some(window) = handle.get_webview_window("main") {
+        let _ = window.navigate(parsed);
+    }
+
+    // When the backend later exits on its own, quit the app so the window does
+    // not sit on a dead page.
+    let _ = url_rx.recv();
+    handle.exit(0);
+    Ok(())
+}
+
+/// Put the child into a job object set to kill everything inside it once the
+/// last handle to the job closes. We hold that handle, so however this process
+/// dies -- clean exit, panic, Task Manager, logoff -- Windows reaps the whole
+/// `dsh web` tree. The `RunEvent::Exit` taskkill stays as the graceful path;
+/// this is the backstop for the paths where it never runs.
+///
+/// The job handle is deliberately leaked: it has to stay open for our entire
+/// lifetime, and the OS closing it during process teardown is precisely the
+/// trigger we want.
+#[cfg(windows)]
+fn confine_to_job(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::addr_of!(info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            return;
+        }
+        AssignProcessToJobObject(job, child.as_raw_handle() as _);
+    }
+}
+
+/// Tray-triggered update check. Manual rather than automatic on startup: an
+/// update replaces the running binary and needs a relaunch, so it must not
+/// happen behind the user's back mid-session.
+async fn check_for_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+    use tauri_plugin_updater::UpdaterExt;
+
+    let result = match app.updater() {
+        Ok(updater) => updater.check().await,
+        Err(e) => {
+            let _ = app.dialog().message(format!("更新器初始化失败：{e}"));
+            return;
+        }
+    };
+
+    match result {
+        Ok(Some(update)) => {
+            let version = update.version.clone();
+            let handle = app.clone();
+            app.dialog()
+                .message(format!(
+                    "发现新版本 {version}（当前 {}）。\n更新后应用会自动重启。",
+                    update.current_version
+                ))
+                .title("DSH Desktop 更新")
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "立即更新".into(),
+                    "稍后".into(),
+                ))
+                .show(move |confirmed| {
+                    if !confirmed {
+                        return;
+                    }
+                    tauri::async_runtime::spawn(async move {
+                        match update.download_and_install(|_, _| {}, || {}).await {
+                            // Relaunch into the new binary; the RunEvent::Exit
+                            // handler still runs, so the backend gets reaped.
+                            Ok(()) => handle.restart(),
+                            Err(e) => {
+                                let _ = handle
+                                    .dialog()
+                                    .message(format!("更新失败：{e}"))
+                                    .title("DSH Desktop 更新")
+                                    .blocking_show();
+                            }
+                        }
+                    });
+                });
+        }
+        Ok(None) => {
+            app.dialog()
+                .message("已经是最新版本。")
+                .title("DSH Desktop 更新")
+                .show(|_| {});
+        }
+        Err(e) => {
+            app.dialog()
+                .message(format!("检查更新失败：{e}"))
+                .title("DSH Desktop 更新")
+                .show(|_| {});
+        }
+    }
+}
+
 struct Spawned {
     child: Child,
     reader: BufReader<std::process::ChildStdout>,
@@ -400,8 +581,8 @@ fn probe_existing_web() -> Option<String> {
 
     let port = probe_port();
     let addr = format!("127.0.0.1:{port}");
-    let mut stream = TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(1200))
-        .ok()?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(1200)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
     let _ = write!(
         stream,
@@ -439,9 +620,10 @@ fn spawn_backend() -> std::io::Result<Spawned> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "failed to capture stdout")
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture stdout"))?;
     let stderr = child.stderr.take();
     Ok(Spawned {
         child,
@@ -463,9 +645,7 @@ fn working_dir() -> std::path::PathBuf {
 fn dirs_home() -> std::path::PathBuf {
     #[cfg(windows)]
     {
-        std::path::PathBuf::from(
-            std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()),
-        )
+        std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()))
     }
     #[cfg(not(windows))]
     {
@@ -479,15 +659,119 @@ fn backend_log_path(app: &tauri::AppHandle) -> tauri::Result<PathBuf> {
     Ok(dir.join("dsh-backend.log"))
 }
 
+/// Size at which the backend log rolls over to `dsh-backend.log.1`.
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Spawn the single thread that owns the log file. Both output pipes feed it
+/// through the returned sender, so the readers never contend for the handle and
+/// rotation has exactly one owner. Without this the log grew unbounded.
+fn spawn_logger(path: PathBuf) -> mpsc::Sender<String> {
+    use std::io::Write;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut file = open_log(&path);
+        let mut size = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        for line in rx {
+            if size + line.len() as u64 > LOG_MAX_BYTES {
+                // Close before renaming: Windows will not rename an open file.
+                drop(file.take());
+                let rotated = path.with_extension("log.1");
+                let _ = std::fs::remove_file(&rotated);
+                let _ = std::fs::rename(&path, &rotated);
+                file = open_log(&path);
+                size = 0;
+            }
+            if let Some(f) = file.as_mut() {
+                if writeln!(f, "{line}").is_ok() {
+                    let _ = f.flush();
+                    size += line.len() as u64 + 1;
+                }
+            }
+        }
+    });
+    tx
+}
+
+fn open_log(path: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// Pull the local GUI URL out of a line of `dsh web` output.
+///
+/// Deliberately strict: the backend prints other URLs too (docs links, a
+/// cloudflared tunnel address, error prose), and navigating to the wrong one
+/// parks the window on something that is not the GUI. We accept only an
+/// `http://` URL that is loopback *and* carries an explicit port -- exactly
+/// what `--port 0` reports -- and keep scanning the line when the first match
+/// does not qualify.
 fn extract_url(line: &str) -> Option<String> {
-    let start = line.find("http://")?;
-    let rest = line[start..].trim();
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    if end == 0 {
-        None
-    } else {
-        Some(rest[..end].to_string())
+    let clean = strip_ansi(line);
+    for (idx, _) in clean.match_indices("http://") {
+        let rest = &clean[idx..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c.is_control())
+            .unwrap_or(rest.len());
+        // Trailing punctuation belongs to the prose, not the URL.
+        let candidate = rest[..end].trim_end_matches(|c| {
+            matches!(
+                c,
+                '.' | ',' | ')' | ']' | '}' | '"' | '\'' | ';' | ':' | '!' | '?'
+            )
+        });
+        let Ok(parsed) = Url::parse(candidate) else {
+            continue;
+        };
+        let loopback = matches!(
+            parsed.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
+        );
+        // Require an explicit :port. `Url::port()` reports None when the port
+        // equals the scheme default (80), so inspect the authority text.
+        let authority = candidate["http://".len()..]
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        let has_port = authority
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+        if parsed.scheme() == "http" && loopback && has_port {
+            return Some(candidate.to_string());
+        }
     }
+    None
+}
+
+/// Strip ANSI CSI escapes (`ESC [ ... final-byte`). `dsh` is a Node CLI and
+/// those routinely colourise URLs; without this the reset code gets glued onto
+/// the end of the address we extract.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() != Some('[') {
+            continue; // stray escape, not a CSI sequence
+        }
+        for c in chars.by_ref() {
+            if ('\x40'..='\x7e').contains(&c) {
+                break; // CSI final byte
+            }
+        }
+    }
+    out
 }
 
 /// Kill the backend and its whole child tree (dsh may spawn helpers such as
@@ -504,5 +788,68 @@ fn kill_process_tree(pid: u32) {
         let _ = cmd.status();
     } else {
         let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_loopback_with_port() {
+        assert_eq!(
+            extract_url("dsh web: http://127.0.0.1:52341\n").as_deref(),
+            Some("http://127.0.0.1:52341")
+        );
+        assert_eq!(
+            extract_url("  ready on http://localhost:3080/app?x=1 \r\n").as_deref(),
+            Some("http://localhost:3080/app?x=1")
+        );
+    }
+
+    #[test]
+    fn requires_an_explicit_port() {
+        // Without a port we cannot tell the GUI from an unrelated docs link,
+        // and `--port 0` always reports one.
+        assert_eq!(extract_url("see http://localhost/docs"), None);
+    }
+
+    #[test]
+    fn rejects_non_loopback() {
+        assert_eq!(extract_url("tunnel: http://example.com:8080"), None);
+    }
+
+    #[test]
+    fn skips_unqualified_match_and_keeps_scanning() {
+        // The real failure this guards: a docs link printed before the GUI URL
+        // used to win because only the first `http://` was ever considered.
+        assert_eq!(
+            extract_url("docs http://example.com/x then http://127.0.0.1:9001").as_deref(),
+            Some("http://127.0.0.1:9001")
+        );
+    }
+
+    #[test]
+    fn trims_trailing_prose_punctuation() {
+        assert_eq!(
+            extract_url("open (http://127.0.0.1:3080).").as_deref(),
+            Some("http://127.0.0.1:3080")
+        );
+    }
+
+    #[test]
+    fn strips_ansi_colour_codes() {
+        assert_eq!(
+            extract_url("\x1b[32mhttp://127.0.0.1:3080\x1b[0m").as_deref(),
+            Some("http://127.0.0.1:3080")
+        );
+    }
+
+    #[test]
+    fn ignores_lines_without_a_url() {
+        assert_eq!(extract_url("Error: EADDRINUSE"), None);
+        assert_eq!(extract_url(""), None);
+        // https is never the local GUI; we only ever serve plain http.
+        assert_eq!(extract_url("https://127.0.0.1:3080"), None);
     }
 }
