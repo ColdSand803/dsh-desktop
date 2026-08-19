@@ -10,15 +10,32 @@
       * {
         box-sizing: border-box;
       }
+      html,
+      body {
+        height: 100%;
+      }
       body {
         margin: 0;
-        min-height: 100vh;
+        display: flex;
+        /* Vertical stack: self-drawn title bar, then content. */
+        flex-direction: column;
+        overflow: hidden;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        /* dsh's dark sidebar fill (--dsw-static-neutral-bluish-900) and its
+           primary text colour (-00). Overwritten at runtime by
+           __dshApplyTheme with whatever the page actually reports. */
+        background: #1b1b1c;
+        color: #fff;
+      }
+      /* Content area below the title bar: centres the splash/error, or is
+         filled edge-to-edge by the GUI iframe. */
+      .content {
+        flex: 1;
+        min-height: 0;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-family: "Segoe UI", system-ui, sans-serif;
-        background: #0f1115;
-        color: #e2e8f0;
+        position: relative;
       }
       .boot {
         text-align: center;
@@ -61,6 +78,74 @@
         color: #94a3b8;
         letter-spacing: 0.02em;
       }
+      /* Self-drawn title bar. Colours are set at runtime by __dshApplyTheme
+         from whatever the dsh page reports, so any theme -- including ones
+         third parties add -- is matched exactly. The defaults below are dsh's
+         dark theme, so the first frame does not flash. */
+      #titlebar {
+        flex: 0 0 32px;
+        display: flex;
+        align-items: center;
+        background: #1b1b1c;
+        color: #fff;
+        /* Colour changes are driven by an 800ms poll, so ease them. */
+        transition: background-color 0.25s ease, color 0.25s ease;
+        user-select: none;
+        font-size: 12px;
+      }
+      #titlebar .drag {
+        flex: 1;
+        min-width: 0;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        padding-left: 12px;
+        letter-spacing: 0.02em;
+        opacity: 0.75;
+        /* Double-click to maximise is wired up in JS. */
+      }
+      #titlebar .controls {
+        display: flex;
+        flex: 0 0 auto;
+        height: 100%;
+      }
+      #titlebar button {
+        width: 46px;
+        height: 100%;
+        border: 0;
+        padding: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        line-height: 1;
+        cursor: default;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background-color 0.15s ease;
+      }
+      /* currentColor keeps hover legible on any theme without knowing it. */
+      #titlebar button:hover {
+        background: color-mix(in srgb, currentColor 16%, transparent);
+      }
+      #titlebar button.close:hover {
+        background: #e11d48;
+        color: #fff;
+      }
+      #titlebar button:focus-visible {
+        outline: 1px solid currentColor;
+        outline-offset: -3px;
+      }
+      /* The dsh GUI. Hidden until the backend URL arrives. */
+      #gui {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        display: none;
+        background: #1b1b1c;
+      }
       /* Boot failure state, filled in by __dshBootError from the Rust host. */
       .error {
         display: none;
@@ -101,7 +186,38 @@
     </style>
   </head>
   <body>
-    <div class="boot" id="boot">
+    <!-- Replaces the native caption (window is built with decorations:false),
+         because a native one cannot be tinted before Windows 11. -->
+    <div id="titlebar">
+      <div class="drag" data-tauri-drag-region id="drag">DSH Desktop</div>
+      <div class="controls">
+        <button type="button" id="btn-min" title="最小化" aria-label="最小化">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+            <rect x="0" y="4.5" width="10" height="1" fill="currentColor" />
+          </svg>
+        </button>
+        <button type="button" id="btn-max" title="最大化" aria-label="最大化">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+            <rect
+              x="0.5"
+              y="0.5"
+              width="9"
+              height="9"
+              fill="none"
+              stroke="currentColor"
+            />
+          </svg>
+        </button>
+        <button type="button" class="close" id="btn-close" title="关闭" aria-label="关闭">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+            <path d="M0 0 L10 10 M10 0 L0 10" stroke="currentColor" fill="none" />
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="content">
+      <iframe id="gui" title="DeepSeek Harness"></iframe>
+      <div class="boot" id="boot">
       <div class="logo">
         <!-- DeepSeek whale, from the dsh frontend's favicon.svg (MIT). -->
         <svg
@@ -128,13 +244,77 @@
         （用 <code style="display:inline;padding:1px 5px">npm i -g @deepseek-ai/dsh</code> 安装）。
         修好后从托盘菜单「退出」再重开。
       </p>
+      </div>
     </div>
     <script>
+      // Paint the title bar with colours the Rust host sampled from the dsh
+      // page. Driven by the dsh-theme event (or the title-marker fallback), so
+      // any theme is matched exactly rather than chosen from two hardcoded
+      // shades -- which is the whole point: a native caption cannot be tinted
+      // before Windows 11.
+      window.__dshApplyTheme = function (bg, fg) {
+        try {
+          var bar = document.getElementById("titlebar");
+          if (bg) bar.style.backgroundColor = bg;
+          if (fg) bar.style.color = fg;
+          // Match the window edges too, so resizing does not flash the old
+          // colour at the margins.
+          if (bg) {
+            document.body.style.backgroundColor = bg;
+            document.getElementById("gui").style.backgroundColor = bg;
+          }
+        } catch (e) {}
+      };
+
+      // Hand the backend URL to the iframe. The window itself is never
+      // navigated -- it has to stay on this page for the title bar to survive.
+      window.__dshSetFrame = function (url) {
+        try {
+          var gui = document.getElementById("gui");
+          if (!url || gui.dataset.src === url) return; // idempotent: host retries
+          gui.dataset.src = url;
+          gui.src = url;
+          gui.style.display = "block";
+          document.getElementById("boot").style.display = "none";
+          document.getElementById("error").style.display = "none";
+        } catch (e) {}
+      };
+
+      // Window controls, replacing the ones decorations:false removed.
+      (function () {
+        var w = window.__TAURI__ && window.__TAURI__.window;
+        var appWindow = w && w.getCurrentWindow && w.getCurrentWindow();
+        function on(id, fn) {
+          var el = document.getElementById(id);
+          if (el) el.addEventListener("click", fn);
+        }
+        if (!appWindow) return; // opened in a plain browser for styling work
+        on("btn-min", function () {
+          appWindow.minimize();
+        });
+        on("btn-max", function () {
+          appWindow.toggleMaximize();
+        });
+        // Close goes through the normal close request, so the existing
+        // hide-to-tray behaviour in main.rs still applies.
+        on("btn-close", function () {
+          appWindow.close();
+        });
+        // Double-clicking the drag strip maximises, as a native caption does.
+        var drag = document.getElementById("drag");
+        if (drag) {
+          drag.addEventListener("dblclick", function () {
+            appWindow.toggleMaximize();
+          });
+        }
+      })();
+
       // Called by the Rust host when the backend never became reachable. The
       // window used to just exit(1) and vanish, leaving no reason on screen.
       window.__dshBootError = function (message, logPath) {
         try {
           document.getElementById("boot").style.display = "none";
+          document.getElementById("gui").style.display = "none";
           var panel = document.getElementById("error");
           panel.style.display = "block";
           // textContent, not innerHTML: the message carries backend output.
