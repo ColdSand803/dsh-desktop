@@ -47,11 +47,68 @@ const NODE_SITE: &str = "https://nodejs.org/";
 /// How long we wait for `dsh web` to print its URL before calling it a failure.
 const BACKEND_READY_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Paint the native title bar to match dsh's theme: dark -> #0f1115 with light
-/// text, light -> #f9fafb with dark text. Called on startup and again whenever
-/// the web page flips its theme (see THEME_WATCH_JS).
+/// Colours sampled from the dsh page, as reported by THEME_WATCH_JS.
+#[derive(Clone, Copy, serde::Deserialize)]
+struct Theme {
+    /// Background actually painted at the top of the page, RGB.
+    bg: [u8; 3],
+    /// A foreground that stays readable on `bg`, RGB.
+    fg: [u8; 3],
+    dark: bool,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        // dsh's dark sidebar, used until the page reports in. These are its own
+        // token values: --dsw-specific-sidebar-fill resolves to
+        // --dsw-static-neutral-bluish-900, and the text token to -00.
+        //
+        // Note rgb(15,17,21) -- which an earlier version used here -- is
+        // neutral-bluish-1000, dsh's *text* colour, not a surface. Using it as
+        // the background is what made the title bar look too dark.
+        Self {
+            bg: [27, 27, 28],
+            fg: [255, 255, 255],
+            dark: true,
+        }
+    }
+}
+
+impl Theme {
+    fn css_bg(&self) -> String {
+        format!("rgb({},{},{})", self.bg[0], self.bg[1], self.bg[2])
+    }
+    fn css_fg(&self) -> String {
+        format!("rgb({},{},{})", self.fg[0], self.fg[1], self.fg[2])
+    }
+}
+
+/// Push a sampled theme to the self-drawn title bar, and tint the native frame
+/// where the OS supports it.
+fn apply_theme(window: &tauri::WebviewWindow, theme: Theme) {
+    let js = format!(
+        "window.__dshApplyTheme && window.__dshApplyTheme({}, {})",
+        serde_json::to_string(&theme.css_bg()).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&theme.css_fg()).unwrap_or_else(|_| "\"\"".into()),
+    );
+    let _ = window.eval(js.as_str());
+
+    #[cfg(windows)]
+    theme_titlebar(window, theme);
+}
+
+/// Tint the window's border and dark-mode flag to match the page.
+///
+/// The window is created with `decorations: false`, so there is no native
+/// caption to paint -- the visible title bar is drawn in `ui/index.html`. What
+/// is still worth setting here is the border colour and the immersive dark-mode
+/// flag, which affect the window frame itself.
+///
+/// Note the caption/text/border colour attributes need Windows 11 (build
+/// 22000+); on Windows 10 they fail harmlessly and only the dark-mode flag
+/// takes effect. That limitation is exactly why the title bar is self-drawn.
 #[cfg(windows)]
-fn theme_titlebar(window: &tauri::WebviewWindow, dark: bool) {
+fn theme_titlebar(window: &tauri::WebviewWindow, theme: Theme) {
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -62,11 +119,12 @@ fn theme_titlebar(window: &tauri::WebviewWindow, dark: bool) {
         Err(_) => return,
     };
 
-    // COLORREF (0x00BBGGRR)
-    let bg: u32 = if dark { 0x0015_110F } else { 0x00FB_FAF9 }; // #0f1115 / #f9fafb
-    let text: u32 = if dark { 0x00F0_E8E2 } else { 0x0037_291F }; // #e2e8f0 / #1f2937
+    // COLORREF is 0x00BBGGRR -- byte order is reversed from hex RGB.
+    let colorref = |c: [u8; 3]| (c[2] as u32) << 16 | (c[1] as u32) << 8 | c[0] as u32;
+    let bg: u32 = colorref(theme.bg);
+    let text: u32 = colorref(theme.fg);
     let border: u32 = bg;
-    let dark_mode: u32 = if dark { 1 } else { 0 };
+    let dark_mode: u32 = u32::from(theme.dark);
 
     unsafe {
         DwmSetWindowAttribute(
@@ -96,47 +154,125 @@ fn theme_titlebar(window: &tauri::WebviewWindow, dark: bool) {
     }
 }
 
-/// Injected into every page the webview loads (including the navigated dsh
-/// GUI): samples the page background to detect dark/light theme and reports it
-/// to the Rust host via the `dsh-theme` event. Polls cheaply every 800ms and
-/// also reacts to class/style mutations on <html>.
+/// Injected into every frame the webview loads, including the dsh GUI running
+/// inside our shell's iframe. Reports dsh's sidebar colour to the Rust host via
+/// the `dsh-theme` event so the self-drawn title bar sits flush with it.
+///
+/// Reads dsh's own design token, `--dsw-specific-sidebar-fill`, rather than
+/// sampling pixels: the token is what dsh itself paints the sidebar with, so a
+/// third-party theme that redefines it is picked up for free, and there is no
+/// dependence on where elements happen to land. Pixel sampling is kept only as
+/// a fallback for a theme that drops the token entirely.
 const THEME_WATCH_JS: &str = r#"
 (function () {
-  function hexToRgb(c) {
-    var n = parseInt(c.slice(1), 16);
-    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  // Only the top-level dsh document should report. Without this the shell page
+  // and the iframe would both emit and fight over the title bar colour.
+  if (window.top !== window && !document.body) return;
+
+  function parseRgb(v) {
+    if (!v) return null;
+    var m = v.match(/[\d.]+/g);
+    if (!m || m.length < 3) return null;
+    // Fully transparent means "whatever is behind me", so it tells us nothing.
+    if (m.length >= 4 && +m[3] === 0) return null;
+    return [+m[0], +m[1], +m[2]];
   }
-  function getDark() {
+
+  // Resolve a CSS custom property to concrete RGB. getComputedStyle already
+  // follows var() chains, so a token defined as var(--something-else) still
+  // comes back as an rgb() triple.
+  function readToken(name) {
     try {
-      var bg = getComputedStyle(document.body).backgroundColor;
-      if (bg && bg.indexOf('rgb') === 0) {
-        var m = bg.match(/[\d.]+/g);
-        if (m && m.length >= 3) {
-          var r = +m[0], g = +m[1], b = +m[2];
-          var lum = 0.299 * r + 0.587 * g + 0.114 * b;
-          return lum < 130;
-        }
+      var v = getComputedStyle(document.body).getPropertyValue(name);
+      return parseRgb(v && v.trim());
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Fallback for a theme that removed the token: walk up from the left edge at
+  // mid-height, which is where the sidebar sits, until something is opaque.
+  function sampleSidebar() {
+    try {
+      var y = Math.floor(window.innerHeight / 2);
+      var el = document.elementFromPoint(8, y);
+      while (el) {
+        var c = parseRgb(getComputedStyle(el).backgroundColor);
+        if (c) return c;
+        el = el.parentElement;
       }
     } catch (e) {}
-    return true;
+    return null;
   }
+
+  function readTheme() {
+    // dsh paints its sidebar with this token, so matching it makes the title
+    // bar continuous with the sidebar instead of merely "dark" or "light".
+    var bg = readToken('--dsw-specific-sidebar-fill') ||
+      sampleSidebar() ||
+      parseRgb(getComputedStyle(document.body).backgroundColor) ||
+      [27, 27, 28];
+    var lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
+    // Trust dsh's own attribute over luminance; fall back to luminance when a
+    // third-party theme does not set it.
+    var dark = document.body
+      ? document.body.hasAttribute('data-ds-dark-theme') || lum < 130
+      : lum < 130;
+    // Derive the foreground from what we sampled instead of reading a token.
+    // Verified in a real Chromium against dsh's CSS: the plausible-looking
+    // tokens are traps. --dsw-alias-label-primary-foreground is *inverted*
+    // (white in the light theme, near-black in the dark one -- it is the
+    // foreground for a filled primary element, not body text), and the
+    // sidebar-nav-item-* tokens are hover/active fills. Either one would paint
+    // near-invisible text. Luminance cannot be inverted, and it keeps working
+    // for a third-party theme whose token set we have never seen.
+    var fg = lum < 130 ? [255, 255, 255] : [15, 17, 21];
+    return { bg: bg, fg: fg, dark: dark };
+  }
+  var eventBroken = false; // latched once we learn the Tauri bridge is unusable
+  var lastMarked = null;   // theme currently encoded into document.title
+
+  function hex(c) {
+    return ('00' + c.toString(16)).slice(-2);
+  }
+
+  function markTitle(t) {
+    // Fallback channel for when the event bridge is unusable: encode the
+    // colours into document.title as [dsh:RRGGBB:RRGGBB]. The host polls it,
+    // applies them, then strips the marker. Only rewrite on an actual change,
+    // otherwise we fight the host for the title every tick.
+    var enc = hex(t.bg[0]) + hex(t.bg[1]) + hex(t.bg[2]) + ':' +
+      hex(t.fg[0]) + hex(t.fg[1]) + hex(t.fg[2]);
+    if (lastMarked === enc) return;
+    lastMarked = enc;
+    try {
+      var s = document.title.replace(/^\[dsh:[0-9a-f]{6}:[0-9a-f]{6}\]/i, '');
+      document.title = '[dsh:' + enc + ']' + (s || 'DSH Desktop');
+    } catch (e) {}
+  }
+
   function report() {
-    var dark = getDark();
-    try {
-      // Primary channel: Tauri event (works when __TAURI__ is injected).
-      if (window.__TAURI__ && window.__TAURI__.event) {
-        window.__TAURI__.event.emit('dsh-theme', { dark: dark });
-        return;
+    var t = readTheme();
+    if (!eventBroken) {
+      try {
+        // Primary channel: Tauri event. Only reaches the host if a capability
+        // declares remote.urls for this origin (capabilities/remote-theme.json).
+        var p = window.__TAURI__ && window.__TAURI__.event &&
+          window.__TAURI__.event.emit('dsh-theme', t);
+        if (p) {
+          // emit() is async, so a capability rejection lands in the promise --
+          // not as a synchronous throw. Latch the fallback when that happens.
+          if (p.catch) {
+            p.catch(function () { eventBroken = true; markTitle(t); });
+          }
+          return;
+        }
+        eventBroken = true; // no bridge injected on this page at all
+      } catch (e) {
+        eventBroken = true;
       }
-    } catch (e) {}
-    try {
-      // Fallback channel: encode the theme into the title, the host polls it.
-      var prefix = dark ? '[dsh-dark]' : '[dsh-light]';
-      var t = document.title;
-      if (t.indexOf('[dsh-') !== 0) {
-        document.title = prefix + (t || 'DSH Desktop');
-      }
-    } catch (e) {}
+    }
+    markTitle(t);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', report);
@@ -145,9 +281,16 @@ const THEME_WATCH_JS: &str = r#"
   }
   setInterval(report, 800);
   try {
-    new MutationObserver(function () { report(); }).observe(
-      document.documentElement, { attributes: true, attributeFilter: ['class', 'style', 'data-theme'] }
-    );
+    var obs = new MutationObserver(function () { report(); });
+    var opts = {
+      attributes: true,
+      attributeFilter: ['class', 'style', 'data-theme', 'data-ds-dark-theme'],
+    };
+    // dsh flips the theme by toggling data-ds-dark-theme on <body>, so watching
+    // only <html> (as this did before) missed every theme change. Watch both:
+    // <html> carries colorScheme, <body> carries the attribute that matters.
+    obs.observe(document.documentElement, opts);
+    if (document.body) obs.observe(document.body, opts);
   } catch (e) {}
 })();
 "#;
@@ -175,60 +318,54 @@ fn main() {
             let handle = app.handle().clone();
             setup_tray(&handle)?;
 
-            // Create the main window at runtime so we can inject the theme
-            // watcher script; it starts on the local splash page and gets
-            // navigated to the backend URL below once it reports ready.
+            // The window stays on our own shell page for its whole life: the
+            // shell draws the title bar, hosts the boot/guidance views, and
+            // later hosts the dsh GUI in an iframe. It is never navigated away,
+            // which is what lets the title bar be any colour -- a native caption
+            // cannot be tinted before Windows 11.
+            //
+            // decorations(false) removes the native caption. The replacement is
+            // in ui/index.html, and the window control permissions it needs are
+            // in capabilities/default.json.
             let window =
                 WebviewWindowBuilder::new(&handle, "main", WebviewUrl::App("index.html".into()))
                     .title("DSH Desktop")
                     .inner_size(1280.0, 840.0)
                     .min_inner_size(800.0, 600.0)
                     .center()
-                    .initialization_script(THEME_WATCH_JS)
+                    .decorations(false)
+                    // for_all_frames: the sampler has to run *inside* the
+                    // iframe, since the shell cannot read across origins into
+                    // the dsh page to find out what colour it is.
+                    .initialization_script_for_all_frames(THEME_WATCH_JS)
                     .build()
                     .map_err(|e| format!("failed to create main window: {e}"))?;
 
-            // React to theme changes coming from the web page (dark/light).
+            // Relay colours from the dsh page to the shell's title bar.
             let theme_handle = handle.clone();
             let _ = handle.listen("dsh-theme", move |event| {
-                let dark = serde_json::from_str::<serde_json::Value>(event.payload())
-                    .ok()
-                    .and_then(|v| v.get("dark").and_then(|d| d.as_bool()))
-                    .unwrap_or(true);
-                #[cfg(windows)]
+                let theme = serde_json::from_str::<Theme>(event.payload()).unwrap_or_default();
                 if let Some(w) = theme_handle.get_webview_window("main") {
-                    theme_titlebar(&w, dark);
+                    apply_theme(&w, theme);
                 }
             });
 
-            // Initial chrome: dsh defaults to the dark theme.
-            #[cfg(windows)]
-            theme_titlebar(&window, true);
+            // Until the page reports in, assume dsh's dark theme.
+            apply_theme(&window, Theme::default());
 
-            // Fallback channel for theme changes: the injected script encodes
-            // "[dsh-dark]"/"[dsh-light]" into document.title when the Tauri
-            // event bridge is unavailable on the navigated page. Poll it so the
-            // title bar follows the page theme on all platforms.
+            // Fallback channel: when the event bridge is unusable the injected
+            // script encodes the colours into document.title as
+            // [dsh:RRGGBB:RRGGBB]. Poll for that, apply it, then strip the
+            // marker so it never shows in the taskbar. The script only re-marks
+            // on an actual change, so this settles instead of looping.
             let title_window = window.clone();
-            std::thread::spawn(move || {
-                let mut last: Option<bool> = None;
-                loop {
-                    let current = title_window.title().ok().and_then(|t| {
-                        if t.starts_with("[dsh-dark]") {
-                            Some(true)
-                        } else if t.starts_with("[dsh-light]") {
-                            Some(false)
-                        } else {
-                            None
-                        }
-                    });
-                    if current.is_some() && current != last {
-                        last = current;
-                        #[cfg(windows)]
-                        theme_titlebar(&title_window, current.unwrap_or(true));
-                    }
-                    std::thread::sleep(Duration::from_millis(800));
+            std::thread::spawn(move || loop {
+                let title = title_window.title().unwrap_or_default();
+                if let Some((theme, len)) = parse_title_marker(&title) {
+                    apply_theme(&title_window, theme);
+                    let _ = title_window.set_title(&title[len..]);
                 }
+                std::thread::sleep(Duration::from_millis(800));
             });
 
             // The backend slot starts empty and is filled by boot_sequence once
@@ -369,7 +506,7 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
     // leave Backend empty: we do not own that backend, and exiting the desktop
     // app must not kill it.
     if let Some(existing) = probe_existing_web() {
-        navigate_to(app, &existing);
+        show_gui(app, &existing);
         return Ok(());
     }
 
@@ -462,10 +599,10 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
         let _ = url_tx.send(String::new());
     });
 
-    // Wait (bounded) for the backend URL, then navigate the window.
+    // Wait (bounded) for the backend URL, then hand it to the shell's iframe.
     match url_rx.recv_timeout(BACKEND_READY_TIMEOUT) {
         Ok(url) if !url.is_empty() => {
-            navigate_to(app, &url);
+            show_gui(app, &url);
             // When the backend later exits on its own, quit the app so the
             // window does not sit on a dead page.
             let app = app.clone();
@@ -494,16 +631,76 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
     }
 }
 
-fn navigate_to(app: &tauri::AppHandle, url: &str) {
+/// Point the shell's iframe at the backend GUI.
+///
+/// The window itself is never navigated: it has to stay on our page so the
+/// self-drawn title bar survives. Retried because the backend can be ready
+/// before the shell has finished loading and `eval` cannot report whether the
+/// handler existed yet; `__dshSetFrame` is idempotent.
+fn show_gui(app: &tauri::AppHandle, url: &str) {
+    // Validate before handing it to the page: `probe_existing_web` builds its
+    // URL from a port number, but the spawned backend's comes out of parsed
+    // stdout, so this is the boundary where a malformed one should stop.
+    let parsed = match Url::parse(url) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("bad backend URL {url:?}: {e}");
+            return;
+        }
+    };
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    match Url::parse(url) {
-        Ok(parsed) => {
-            let _ = window.navigate(parsed);
+    // Cache it as the current status too. The window no longer navigates, so
+    // the shell page can be reloaded while the GUI is up; without this it would
+    // ask for the status, be told "booting", and sit on the splash forever.
+    emit_status(app, "ready", vec![parsed.as_str().to_string()]);
+
+    let js = format!(
+        "window.__dshSetFrame && window.__dshSetFrame({})",
+        serde_json::to_string(parsed.as_str()).unwrap_or_else(|_| "\"\"".into()),
+    );
+    for attempt in 0..6 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(350));
         }
-        Err(e) => eprintln!("bad backend URL {url:?}: {e}"),
+        let _ = window.eval(js.as_str());
     }
+}
+
+/// Parse the `[dsh:RRGGBB:RRGGBB]` prefix the injected script writes into
+/// document.title when the event bridge is unusable. Returns the theme and the
+/// byte length of the marker so the caller can strip it.
+///
+/// The marker is fixed-width by construction, so anything that does not match
+/// exactly is treated as a normal title rather than partially parsed.
+fn parse_title_marker(title: &str) -> Option<(Theme, usize)> {
+    const LEN: usize = "[dsh:rrggbb:rrggbb]".len();
+    let body = title.strip_prefix("[dsh:")?;
+    let end = body.find(']')?;
+    let (hexes, _) = body.split_at(end);
+    let (bg, fg) = hexes.split_once(':')?;
+    if bg.len() != 6 || fg.len() != 6 {
+        return None;
+    }
+    let rgb = |s: &str| -> Option<[u8; 3]> {
+        Some([
+            u8::from_str_radix(&s[0..2], 16).ok()?,
+            u8::from_str_radix(&s[2..4], 16).ok()?,
+            u8::from_str_radix(&s[4..6], 16).ok()?,
+        ])
+    };
+    let bg = rgb(bg)?;
+    let fg = rgb(fg)?;
+    let lum = 0.299 * bg[0] as f32 + 0.587 * bg[1] as f32 + 0.114 * bg[2] as f32;
+    Some((
+        Theme {
+            bg,
+            fg,
+            dark: lum < 130.0,
+        },
+        LEN,
+    ))
 }
 
 /// Forward one of the backend's output streams into the log channel, tagging
@@ -1308,6 +1505,36 @@ mod tests {
             extract_url("\x1b[32mhttp://127.0.0.1:3080\x1b[0m").as_deref(),
             Some("http://127.0.0.1:3080")
         );
+    }
+
+    #[test]
+    fn parses_a_title_colour_marker() {
+        let (theme, len) = parse_title_marker("[dsh:0f1115:e2e8f0]DeepSeek Harness").unwrap();
+        assert_eq!(theme.bg, [0x0f, 0x11, 0x15]);
+        assert_eq!(theme.fg, [0xe2, 0xe8, 0xf0]);
+        assert!(theme.dark, "0f1115 is dark");
+        // The caller strips by this length, so it must land exactly after ']'.
+        assert_eq!(
+            &"[dsh:0f1115:e2e8f0]DeepSeek Harness"[len..],
+            "DeepSeek Harness"
+        );
+    }
+
+    #[test]
+    fn derives_dark_from_the_sampled_colour() {
+        // A light theme, and an arbitrary third-party one, both classified by
+        // luminance rather than a hardcoded list.
+        assert!(!parse_title_marker("[dsh:f9fafb:1f2937]x").unwrap().0.dark);
+        assert!(parse_title_marker("[dsh:2d1b4e:ffffff]x").unwrap().0.dark);
+    }
+
+    #[test]
+    fn rejects_malformed_title_markers() {
+        assert!(parse_title_marker("DeepSeek Harness").is_none());
+        assert!(parse_title_marker("[dsh:0f1115]x").is_none()); // one colour
+        assert!(parse_title_marker("[dsh:0f111:e2e8f0]x").is_none()); // short hex
+        assert!(parse_title_marker("[dsh:zzzzzz:e2e8f0]x").is_none()); // not hex
+        assert!(parse_title_marker("[dsh:0f1115:e2e8f0").is_none()); // unterminated
     }
 
     #[test]

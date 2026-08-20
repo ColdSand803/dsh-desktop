@@ -10,24 +10,120 @@
       * {
         box-sizing: border-box;
       }
-      /* NOTE: the host samples this background to decide whether to paint the
-         title bar dark or light (THEME_WATCH_JS in src-tauri/src/main.rs).
-         Keep it dark, or the native chrome stops matching the page. */
+      html,
+      body {
+        height: 100%;
+      }
+      /* The shell's own colours are overwritten at runtime by __dshApplyTheme
+         with whatever the dsh page reports, so any theme is matched exactly.
+         The defaults are dsh's dark sidebar fill
+         (--dsw-static-neutral-bluish-900) and its primary text colour (-00),
+         so the first frame does not flash.
+
+         Note #0f1115 -- used here before -- is neutral-bluish-1000, dsh's
+         *text* colour rather than a surface; as a background it read too dark. */
       body {
         margin: 0;
-        min-height: 100vh;
+        display: flex;
+        /* Vertical stack: self-drawn title bar, then content. */
+        flex-direction: column;
+        overflow: hidden;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: #1b1b1c;
+        color: #fff;
+      }
+
+      /* ---------- self-drawn title bar ----------
+         Replaces the native caption (the window is built with
+         decorations:false), because a native one cannot be tinted before
+         Windows 11. Colours come from __dshApplyTheme at runtime. */
+      #titlebar {
+        flex: 0 0 32px;
+        display: flex;
+        align-items: center;
+        background: #1b1b1c;
+        color: #fff;
+        /* Colour changes are driven by an 800ms poll, so ease them. */
+        transition: background-color 0.25s ease, color 0.25s ease;
+        user-select: none;
+        font-size: 12px;
+      }
+      #titlebar .drag {
+        flex: 1;
+        min-width: 0;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        padding-left: 12px;
+        letter-spacing: 0.02em;
+        opacity: 0.75;
+        /* Double-click to maximise is wired up in JS. */
+      }
+      #titlebar .controls {
+        display: flex;
+        flex: 0 0 auto;
+        height: 100%;
+      }
+      #titlebar button {
+        width: 46px;
+        height: 100%;
+        border: 0;
+        padding: 0;
+        margin: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        line-height: 1;
+        cursor: default;
         display: flex;
         align-items: center;
         justify-content: center;
-        padding: 32px;
-        font-family: "Segoe UI", system-ui, sans-serif;
-        background: #0f1115;
-        color: #e2e8f0;
+        transition: background-color 0.15s ease;
+      }
+      /* currentColor keeps hover legible on any theme without knowing it. */
+      #titlebar button:hover {
+        background: color-mix(in srgb, currentColor 16%, transparent);
+      }
+      #titlebar button.close:hover {
+        background: #e11d48;
+        color: #fff;
+      }
+      #titlebar button:focus-visible {
+        outline: 1px solid currentColor;
+        outline-offset: -3px;
+      }
+
+      /* ---------- content area ----------
+         Centres whichever boot view is active, or is filled edge-to-edge by
+         the GUI iframe once the backend is up. */
+      .content {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+      }
+      /* The dsh GUI. Hidden until the backend URL arrives. */
+      #gui {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        display: none;
+        background: #1b1b1c;
+      }
+      #views {
+        width: 100%;
+        max-width: 560px;
+        padding: 24px;
+      }
+      #views.hidden {
+        display: none;
       }
       .view {
         display: none;
-        width: 100%;
-        max-width: 560px;
         text-align: center;
       }
       .view.active {
@@ -88,7 +184,8 @@
         padding: 12px 14px;
         text-align: left;
       }
-      button {
+      /* Scoped to #views so the title bar's own buttons keep their chrome. */
+      #views button {
         font: inherit;
         font-size: 14px;
         padding: 9px 20px;
@@ -99,19 +196,19 @@
         color: #e2e8f0;
         cursor: pointer;
       }
-      button:hover:not(:disabled) {
+      #views button:hover:not(:disabled) {
         background: #232a35;
       }
-      button:disabled {
+      #views button:disabled {
         opacity: 0.5;
         cursor: default;
       }
-      button.primary {
+      #views button.primary {
         border-color: transparent;
         background: #3c6eff;
         color: #fff;
       }
-      button.primary:hover:not(:disabled) {
+      #views button.primary:hover:not(:disabled) {
         background: #2f5ce0;
       }
       .log {
@@ -147,47 +244,93 @@
     </style>
   </head>
   <body>
-    <div class="view active" id="view-booting">
-      <div class="logo pulse">dsh</div>
-      <div class="text" id="boot-text">正在启动 DeepSeek Harness…</div>
-    </div>
-
-    <div class="view" id="view-missing-dsh">
-      <div class="logo">dsh</div>
-      <h1>还没有安装 dsh</h1>
-      <div class="text">
-        这个桌面端是 DeepSeek Harness 的外壳，需要本机的 <code>dsh</code> 命令来跑服务。
-        可以现在装上，也可以自己在终端里执行下面这条命令：
+    <!-- Replaces the native caption (window is built with decorations:false),
+         because a native one cannot be tinted before Windows 11. -->
+    <div id="titlebar">
+      <div class="drag" data-tauri-drag-region id="drag">DSH Desktop</div>
+      <div class="controls">
+        <button type="button" id="btn-min" title="最小化" aria-label="最小化">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+            <rect x="0" y="4.5" width="10" height="1" fill="currentColor" />
+          </svg>
+        </button>
+        <button type="button" id="btn-max" title="最大化" aria-label="最大化">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+            <rect
+              x="0.5"
+              y="0.5"
+              width="9"
+              height="9"
+              fill="none"
+              stroke="currentColor"
+            />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="close"
+          id="btn-close"
+          title="关闭"
+          aria-label="关闭"
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+            <path
+              d="M0 0 L10 10 M10 0 L0 10"
+              stroke="currentColor"
+              fill="none"
+            />
+          </svg>
+        </button>
       </div>
-      <code class="cmd">npm install -g @deepseek-ai/dsh</code>
-      <button class="primary" id="btn-install">一键安装</button>
     </div>
 
-    <div class="view" id="view-installing">
-      <div class="logo pulse">dsh</div>
-      <h1>正在安装 dsh</h1>
-      <div class="text">首次安装要下载几百 MB，慢一点是正常的。</div>
-      <div class="log" id="install-log"></div>
-    </div>
+    <div class="content">
+      <iframe id="gui" title="DeepSeek Harness"></iframe>
 
-    <div class="view" id="view-missing-node">
-      <div class="logo">dsh</div>
-      <h1>需要先装 Node.js</h1>
-      <div class="text">
-        本机没有找到 <code>npm</code>，所以没法自动装 dsh。
-        先装 Node.js（建议 LTS 版本），装完重开这个应用，就能一键安装 dsh 了。
+      <div id="views">
+        <div class="view active" id="view-booting">
+          <div class="logo pulse">dsh</div>
+          <div class="text" id="boot-text">正在启动 DeepSeek Harness…</div>
+        </div>
+
+        <div class="view" id="view-missing-dsh">
+          <div class="logo">dsh</div>
+          <h1>还没有安装 dsh</h1>
+          <div class="text">
+            这个桌面端是 DeepSeek Harness 的外壳，需要本机的
+            <code>dsh</code> 命令来跑服务。 可以现在装上，也可以自己在终端里执行下面这条命令：
+          </div>
+          <code class="cmd">npm install -g @deepseek-ai/dsh</code>
+          <button class="primary" id="btn-install">一键安装</button>
+        </div>
+
+        <div class="view" id="view-installing">
+          <div class="logo pulse">dsh</div>
+          <h1>正在安装 dsh</h1>
+          <div class="text">首次安装要下载几百 MB，慢一点是正常的。</div>
+          <div class="log" id="install-log"></div>
+        </div>
+
+        <div class="view" id="view-missing-node">
+          <div class="logo">dsh</div>
+          <h1>需要先装 Node.js</h1>
+          <div class="text">
+            本机没有找到 <code>npm</code>，所以没法自动装 dsh。
+            先装 Node.js（建议 LTS 版本），装完重开这个应用，就能一键安装 dsh 了。
+          </div>
+          <div class="text">
+            装好 Node.js 后也可以自己执行：<code>npm install -g @deepseek-ai/dsh</code>
+          </div>
+          <button class="primary" id="btn-node">打开 nodejs.org</button>
+        </div>
+
+        <div class="view" id="view-error">
+          <div class="logo">dsh</div>
+          <h1>启动失败</h1>
+          <div class="detail" id="error-detail"></div>
+          <button class="primary" id="btn-retry">重试</button>
+        </div>
       </div>
-      <div class="text">
-        装好 Node.js 后也可以自己执行：<code>npm install -g @deepseek-ai/dsh</code>
-      </div>
-      <button class="primary" id="btn-node">打开 nodejs.org</button>
-    </div>
-
-    <div class="view" id="view-error">
-      <div class="logo">dsh</div>
-      <h1>启动失败</h1>
-      <div class="detail" id="error-detail"></div>
-      <button class="primary" id="btn-retry">重试</button>
     </div>
 
     <script>
@@ -196,6 +339,8 @@
       const tauri = window.__TAURI__;
       const invoke = tauri && tauri.core ? tauri.core.invoke : null;
 
+      const gui = document.getElementById("gui");
+      const viewsBox = document.getElementById("views");
       const views = {};
       for (const el of document.querySelectorAll(".view")) {
         views[el.id.slice("view-".length)] = el;
@@ -207,11 +352,54 @@
       // Buttons disable themselves while their command runs; remember the
       // original labels so a view we come back to is usable again.
       const labels = new Map();
-      for (const btn of document.querySelectorAll("button")) {
+      for (const btn of viewsBox.querySelectorAll("button")) {
         labels.set(btn, btn.textContent);
       }
 
+      // Paint the title bar with colours the Rust host sampled from the dsh
+      // page. Driven by the dsh-theme event (or the title-marker fallback), so
+      // any theme is matched exactly rather than chosen from two hardcoded
+      // shades — which is the whole point: a native caption cannot be tinted
+      // before Windows 11.
+      window.__dshApplyTheme = function (bg, fg) {
+        try {
+          const bar = document.getElementById("titlebar");
+          if (bg) bar.style.backgroundColor = bg;
+          if (fg) bar.style.color = fg;
+          // Match the window edges too, so resizing does not flash the old
+          // colour at the margins.
+          if (bg) {
+            document.body.style.backgroundColor = bg;
+            gui.style.backgroundColor = bg;
+          }
+        } catch (e) {}
+      };
+
+      // Hand the backend URL to the iframe. The window itself is never
+      // navigated — it has to stay on this page for the title bar to survive.
+      window.__dshSetFrame = function (url) {
+        try {
+          if (!url || gui.dataset.src === url) return; // idempotent: host retries
+          gui.dataset.src = url;
+          gui.src = url;
+          gui.style.display = "block";
+          viewsBox.classList.add("hidden");
+        } catch (e) {}
+      };
+
       function show(state, detail) {
+        // `ready` is not a view: the GUI is up, so the iframe owns the content
+        // area. Sent so a page that reloads after the handoff can restore it
+        // instead of sitting on the splash forever.
+        if (state === "ready") {
+          const url = Array.isArray(detail) ? detail[0] : null;
+          if (url) window.__dshSetFrame(url);
+          return;
+        }
+        // Any other state means we are not serving a GUI right now.
+        gui.style.display = "none";
+        viewsBox.classList.remove("hidden");
+
         const view = views[state] || views.booting;
         for (const el of Object.values(views)) {
           el.classList.toggle("active", el === view);
@@ -257,6 +445,25 @@
       wire("btn-retry", "retry_boot", "重试中…");
       wire("btn-node", "open_node_site");
 
+      // Window controls, replacing the ones decorations:false removed.
+      (function () {
+        const w = tauri && tauri.window;
+        const appWindow = w && w.getCurrentWindow && w.getCurrentWindow();
+        if (!appWindow) return; // opened in a plain browser for styling work
+        function on(id, fn) {
+          const el = document.getElementById(id);
+          if (el) el.addEventListener("click", fn);
+        }
+        on("btn-min", () => appWindow.minimize());
+        on("btn-max", () => appWindow.toggleMaximize());
+        // Close goes through the normal close request, so the existing
+        // hide-to-tray behaviour in main.rs still applies.
+        on("btn-close", () => appWindow.close());
+        // Double-clicking the drag strip maximises, as a native caption does.
+        const drag = document.getElementById("drag");
+        if (drag) drag.addEventListener("dblclick", () => appWindow.toggleMaximize());
+      })();
+
       if (tauri && tauri.event) {
         tauri.event.listen("dsh-status", (e) => {
           const p = e.payload || {};
@@ -275,3 +482,4 @@
     </script>
   </body>
 </html>
+

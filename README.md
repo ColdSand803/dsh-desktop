@@ -3,13 +3,13 @@
 DeepSeek Harness (dsh) 的桌面客户端。用 [Tauri v2](https://tauri.app) 把 `dsh web` 包成一个原生 Windows 应用：
 
 - **图标**：应用/任务栏/托盘统一使用 DeepSeek 官方鲸鱼 logo（取自 DSH 前端 favicon，即折叠侧边栏的图标）
-- **顶栏跟随主题**：注入 WebView 脚本监测页面明暗主题并实时同步窗口标题栏——
-  深色主题下标题栏为 `#0f1115` 深色、浅色主题下为 `#f9fafb` 浅色，随 dsh 主题切换联动
-  （Windows 10 上为模式级明暗跟随；精确 RGB 染色需 Windows 11 的 DWM 扩展属性）
+- **标题栏和 dsh 侧边栏同色**：标题栏是自己画的（窗口以 `decorations: false` 创建，没有原生标题栏），
+  颜色不是两档硬编码色，而是读 dsh 自己的设计 token `--dsw-specific-sidebar-fill` 取到的实际 RGB。
+  换主题（包括第三方主题）会跟着变，**Win10 / Win11 表现一致**
 - **无黑窗口**：spawn 后端与清理进程时都带 `CREATE_NO_WINDOW`，全程无命令行窗口闪现
 - **托盘常驻**：系统托盘显示鲸鱼图标，左键单击唤出窗口；关闭窗口 = 最小化到托盘（后端继续运行）；托盘菜单「退出」彻底退出并清理后端
 - 启动时先探测 3080 上是否已有 dsh web：有就复用，没有才自己拉起 `dsh web --port 0`（系统分配空闲端口），
-  解析后端输出把窗口导航到实际地址
+  解析后端输出，把实际地址交给外壳页的 iframe（窗口本身不导航，见下）
 - **没装 dsh 也能用**：启动前先探测环境，缺 `dsh` 时窗口停在引导页，可一键 `npm i -g @deepseek-ai/dsh`（日志实时显示），装完自动接着启动；连 npm 都没有则引导去装 Node.js
 - 退出时结束整个后端进程树（含 cloudflared 等辅助进程），Windows 上直接 `taskkill /T /F`。这里没有「先礼后兵」的余地：后端是个无窗口的 `cmd` 套 node，普通 `taskkill /T` 对树里每个进程都只回一句「只能强制终止此任务(带 /F 选项)」，等它等不出结果，只会拖长退出——而退出没完成前单实例锁不释放，「退出后立刻重开」会静默失效。留下的残留由下次启动时的锁清理兜住
 - **异常终止也不残留**：后端子进程被放进 Windows Job Object（`KILL_ON_JOB_CLOSE`），即使桌面端 panic、被任务管理器结束或用户注销，整个 `dsh web` 进程树也会被系统连带回收
@@ -100,6 +100,18 @@ git tag v0.1.0 && git push --tags
     这样可以避开 task-board 的单实例锁互相冲突。这种情况下退出桌面端**不会**杀掉那个后端——它不归我们管。
   - 没探到，才自己拉起 `dsh web --port 0` 让系统挑空闲端口。
 
+- **标题栏 / 外壳结构**：窗口以 `decorations: false` 创建，整个生命周期都停在 `ui/index.html`
+  这个外壳页上，**从不导航**。外壳自己画标题栏（含最小化 / 最大化 / 关闭，靠 `capabilities/default.json`
+  里的 `core:window:*` 权限），dsh 的 GUI 装在外壳的 iframe 里。
+
+  之所以要这样：原生标题栏只能靠 `DwmSetWindowAttribute` 染色，而那几个属性要 Windows 11。
+  自绘就完全绕开 DWM，Win10 上也准。代价是 GUI 降级成 iframe——如果窗口本身导航到后端地址，
+  自绘的标题栏会跟着那个页面一起消失。
+
+  取色靠 `initialization_script_for_all_frames` 把采样脚本注入到 **iframe 内部**（外壳受同源策略
+  限制，读不到 dsh 页面的颜色），脚本读 `--dsw-specific-sidebar-fill` 后通过 `dsh-theme` 事件上报；
+  事件通道不可用时退化成把颜色编码进 `document.title`（`[dsh:RRGGBB:RRGGBB]`）由宿主轮询。
+
 - **关窗与退出**：点窗口关闭按钮会把窗口隐藏到托盘（后端继续服务），这是桌面常驻应用的常规行为。
   要真正结束，请用托盘右键菜单的「退出」，或在托盘图标上左键唤回窗口。若希望「关窗即完全退出」，
   把 `main.rs` 中 `RunEvent::WindowEvent ... CloseRequested` 分支删掉即可恢复默认行为。
@@ -151,13 +163,14 @@ dsh-desktop/
 ├── .github/workflows/
 │   ├── ci.yml           # windows-latest 上跑 fmt / clippy / test
 │   └── release.yml      # 打 tag 时构建、签名、建 draft release
-├── ui/                  # 启动 / 引导页（状态机：启动中、缺 dsh、安装中、缺 Node、出错）
+├── ui/                  # 外壳页：自绘标题栏 + GUI iframe + 引导状态机
+│                        #   （启动中、缺 dsh、安装中、缺 Node、出错、ready）
 ├── scripts/
 │   └── gen-icons.js     # 从 DSH favicon.svg 渲染 DeepSeek 鲸鱼图标（应用 + 托盘）
 ├── src-tauri/
-│   ├── src/main.rs      # 核心：环境探测 / 一键安装 / 拉起后端 / 导航窗口 / 托盘 / 退出清理
+│   ├── src/main.rs      # 核心：环境探测 / 一键安装 / 拉起后端 / 主题取色 / 托盘 / 退出清理
 │   ├── capabilities/
-│   │   ├── default.json      # 本地引导页的权限
+│   │   ├── default.json      # 外壳页的权限（含自绘标题栏要的 core:window:*）
 │   │   └── remote-theme.json # 后端 origin 的权限：只给 event:emit，用于主题上报
 │   ├── Cargo.toml
 │   ├── tauri.conf.json  # 窗口与打包配置
@@ -172,13 +185,17 @@ dsh-desktop/
   （这两个都会改变用户可见行为，默认打开不合适，所以留空。）
 - 自动更新是**手动触发**的（托盘「检查更新」），不会在启动时自动查。更新会替换正在运行的
   二进制并需要重启，不该在用户不知情的时候发生。
-- 标题栏精确染色需要 Windows 11：`DWMWA_CAPTION_COLOR` / `TEXT_COLOR` / `BORDER_COLOR` 要 build 22000+，
-  Win10 上这几个调用会无害失败，只剩 `USE_IMMERSIVE_DARK_MODE` 生效（模式级明暗跟随）。
+- **GUI 跑在 iframe 里**（见上「标题栏」一节的原因）。这条是自绘标题栏的代价，且**尚未在装了 dsh
+  的机器上验证过**：dsh 的前端如果有 frame-busting、依赖 `window.top`、或者自己开新窗口，
+  在 iframe 里可能有异常。真机跑之前请把这条当作未知项。
+- `DWMWA_CAPTION_COLOR` / `TEXT_COLOR` / `BORDER_COLOR` 仍然要 Windows 11（build 22000+），
+  Win10 上无害失败。但这**不影响标题栏颜色**——标题栏是自绘的，不经过 DWM；这几个属性现在只用来
+  染窗口边框，以及设 `USE_IMMERSIVE_DARK_MODE`。
 - 未使用 macOS/Linux 深度适配（代码里做了 `sh -c` 分支，理论上可跨平台，但只在 Windows 验证过）。
   Job Object 清理是 Windows 专有的，其他平台只有退出时的 `SIGTERM` → `kill -9`。
 - 依赖 `dsh` 的 **stdout 格式**：靠解析 `dsh web: http://127.0.0.1:<port>` 拿地址。
   dsh 目前是 developer preview（`0.1.0-rc.7`，README 明说会有破坏性变更），
-  哪天改了输出格式，导航会失败并停在引导页的错误态上。
+  哪天改了输出格式，就拿不到地址，会停在外壳页的错误态上。
 - 一键安装走的是系统默认 npm registry，公司内网/需要代理的环境可能装不动——这种情况下按页面上给的
   命令自己在终端里装（可以先配好 registry 或代理）。
 - Windows 下退出必然是强杀（原因见上），所以**正在装插件时退出应用有损坏 dsh 插件目录的风险**：dsh 用 pnpm 换包时是「先清空目标目录、再把 `<pkg>_tmp_...` 改名盖上去」，强杀正好落在这中间，那个包就只剩一个没有 `package.json` 的 `src/`，下次启动报 `ERR_MODULE_NOT_FOUND`，得重装该包才能恢复。Job Object 只保证「一定收得干净」，不解决「收得优雅」——要根治得让后端能优雅退出（Windows 上的正路是给 `cmd` 发 CTRL_BREAK），目前没做。装插件时请等它装完再退出。
