@@ -7,8 +7,64 @@ const fs = require("fs");
 const path = require("path");
 const { Resvg } = require("@resvg/resvg-js");
 
+const { execFileSync } = require("child_process");
+
 const root = path.resolve(__dirname, "..");
-const faviconPath = "D:/nodejs/22/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist/favicon.svg";
+
+// Locate the dsh frontend's favicon.svg. This used to be a hardcoded absolute
+// path into one machine's global node_modules, which broke this script for
+// everyone else (and for that machine as soon as Node was upgraded).
+const FAVICON_PKG = "@deepseek-ai/dsh-web-frontend/dist/favicon.svg";
+
+function npmGlobalRoot() {
+  try {
+    return execFileSync("npm", ["root", "-g"], {
+      encoding: "utf8",
+      shell: process.platform === "win32",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function resolveFavicon() {
+  // 1) Explicit override always wins.
+  if (process.env.DSH_FAVICON) return process.env.DSH_FAVICON;
+
+  const tried = [];
+
+  // 2) Normal resolution: works when dsh is a local dependency.
+  try {
+    return require.resolve(FAVICON_PKG);
+  } catch {
+    tried.push(`require.resolve("${FAVICON_PKG}")`);
+  }
+
+  // 3) Global install: dsh nests the frontend under its own node_modules.
+  const globalRoot = npmGlobalRoot();
+  if (globalRoot) {
+    const candidates = [
+      path.join(globalRoot, "@deepseek-ai/dsh/node_modules", FAVICON_PKG),
+      path.join(globalRoot, FAVICON_PKG),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) return candidate;
+      tried.push(candidate);
+    }
+  } else {
+    tried.push("npm root -g (command failed)");
+  }
+
+  throw new Error(
+    `找不到 dsh 前端的 favicon.svg。已尝试：\n  ${tried.join("\n  ")}\n` +
+      `请先安装 dsh（npm i -g @deepseek-ai/dsh），` +
+      `或用 DSH_FAVICON=<path-to-favicon.svg> 指定路径。`
+  );
+}
+
+const faviconPath = resolveFavicon();
+console.log("favicon:", faviconPath);
 const favicon = fs.readFileSync(faviconPath, "utf8");
 
 const m = favicon.match(/\sd="([^"]+)"/);

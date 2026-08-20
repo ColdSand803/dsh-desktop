@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "remote-theme",
+  "description": "Lets the locally-served dsh GUI report its light/dark theme to the host so the native title bar can follow it. Deliberately emit-only: the dsh page renders model output, so it must not inherit the `default` capability's core:default grant (window control, path, app APIs). Capabilities without a `remote` block do not apply to remote origins, so this is the only surface the backend origin gets.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": ["core:event:allow-emit"]
+}

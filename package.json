@@ -3,6 +3,19 @@
   "version": "0.1.0",
   "private": true,
   "description": "Desktop shell for DeepSeek Harness (dsh web)",
+  "license": "MIT",
+  "author": "ColdSand803",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ColdSand803/dsh-desktop.git"
+  },
+  "homepage": "https://github.com/ColdSand803/dsh-desktop#readme",
+  "bugs": {
+    "url": "https://github.com/ColdSand803/dsh-desktop/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",

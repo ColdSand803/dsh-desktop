@@ -1,7 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability: allow the main window to emit theme events to the Rust host",
+  "description": "Default capability for the bundled boot page: event listening (dsh-status, dsh-install-log) plus the IPC it needs to report status and trigger the install. The window-control grants the self-drawn title bar needed are deliberately absent — this tree uses the native title bar, so nothing calls them.",
   "windows": ["main"],
-  "permissions": ["core:default", "core:event:default"]
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "updater:default",
+    "dialog:default"
+  ]
 }

@@ -5,6 +5,13 @@ src-tauri/gen/schemas/
 # Node
 node_modules/
 
+# Updater signing keys -- NEVER commit these. The private key is the only thing
+# authorising updates for existing installs; if it leaks, anyone can push an
+# update to every user, and if it is lost, nobody can be updated ever again.
+*.key
+*.key.pub
+.tauri/
+
 # Misc
 .DS_Store
 Thumbs.db

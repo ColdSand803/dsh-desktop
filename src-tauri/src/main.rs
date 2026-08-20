@@ -53,8 +53,8 @@ const BACKEND_READY_TIMEOUT: Duration = Duration::from_secs(90);
 #[cfg(windows)]
 fn theme_titlebar(window: &tauri::WebviewWindow, dark: bool) {
     use windows_sys::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
-        DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
     };
 
     let hwnd = match window.hwnd() {
@@ -154,6 +154,8 @@ const THEME_WATCH_JS: &str = r#"
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Second launch: focus the existing window (show it first in case
             // it was hidden to the tray).
@@ -176,18 +178,15 @@ fn main() {
             // Create the main window at runtime so we can inject the theme
             // watcher script; it starts on the local splash page and gets
             // navigated to the backend URL below once it reports ready.
-            let window = WebviewWindowBuilder::new(
-                &handle,
-                "main",
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("DSH Desktop")
-            .inner_size(1280.0, 840.0)
-            .min_inner_size(800.0, 600.0)
-            .center()
-            .initialization_script(THEME_WATCH_JS)
-            .build()
-            .map_err(|e| format!("failed to create main window: {e}"))?;
+            let window =
+                WebviewWindowBuilder::new(&handle, "main", WebviewUrl::App("index.html".into()))
+                    .title("DSH Desktop")
+                    .inner_size(1280.0, 840.0)
+                    .min_inner_size(800.0, 600.0)
+                    .center()
+                    .initialization_script(THEME_WATCH_JS)
+                    .build()
+                    .map_err(|e| format!("failed to create main window: {e}"))?;
 
             // React to theme changes coming from the web page (dark/light).
             let theme_handle = handle.clone();
@@ -261,14 +260,14 @@ fn main() {
                     let _ = window.hide();
                 }
             }
-            RunEvent::Exit => {
-                if take_backend(app_handle).is_some() {
-                    // A backend that shut down cleanly released its own lock;
-                    // one we had to force did not. Clear it either way, so a dsh
-                    // started outside this app (browser tab) is not blocked by
-                    // our leftovers.
-                    clear_stale_task_board_lock();
-                }
+            // The guard does the work: `take_backend` kills the child we own, and
+            // answers None when there is nothing to kill (never started, or we
+            // are reusing a backend that belongs to somebody else).
+            RunEvent::Exit if take_backend(app_handle).is_some() => {
+                // A backend that shut down cleanly released its own lock; one we
+                // had to force did not. Clear it either way, so a dsh started
+                // outside this app (browser tab) is not blocked by our leftovers.
+                clear_stale_task_board_lock();
             }
             _ => {}
         });
@@ -302,14 +301,18 @@ fn current_status(app: tauri::AppHandle) -> serde_json::Value {
 enum Preflight {
     Ready,
     /// No `dsh` on PATH. `has_npm` decides whether we can offer to install it.
-    NoDsh { has_npm: bool },
+    NoDsh {
+        has_npm: bool,
+    },
 }
 
 fn preflight() -> Preflight {
     if has_command("dsh") {
         Preflight::Ready
     } else {
-        Preflight::NoDsh { has_npm: has_command("npm") }
+        Preflight::NoDsh {
+            has_npm: has_command("npm"),
+        }
     }
 }
 
@@ -376,7 +379,15 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
     match preflight() {
         Preflight::Ready => {}
         Preflight::NoDsh { has_npm } => {
-            emit_status(app, if has_npm { "missing-dsh" } else { "missing-node" }, Vec::new());
+            emit_status(
+                app,
+                if has_npm {
+                    "missing-dsh"
+                } else {
+                    "missing-node"
+                },
+                Vec::new(),
+            );
             return Ok(());
         }
     }
@@ -388,44 +399,54 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
     // A retry after a failed start may still be holding a dead (or dying) child.
     take_backend(app);
 
-    let mut spawned = spawn_backend()
-        .map_err(|e| vec![format!("无法启动 `dsh web`：{e}")])?;
+    let mut spawned = spawn_backend().map_err(|e| vec![format!("无法启动 `dsh web`：{e}")])?;
     let stderr = spawned.stderr.take();
-    let log_file = backend_log_path(app)
-        .map_err(|e| vec![format!("无法打开后端日志：{e}")])?;
+    let log_file = backend_log_path(app).map_err(|e| vec![format!("无法打开后端日志：{e}")])?;
     let (url_tx, url_rx) = mpsc::channel::<String>();
-    // Closed once the stderr logger has flushed everything it will ever write,
-    // so a failure path can read a complete log instead of racing it.
-    let (logged_tx, logged_rx) = mpsc::channel::<()>();
+    // One thread owns the log file; both pipes feed it through `log_tx`. The
+    // receiver disconnects once it has written everything it will ever write, so
+    // a failure path can summarize a complete log instead of racing it.
+    let (log_tx, log_done) = spawn_logger(log_file.clone());
+
+    // Tie the child to a job object so the whole `dsh web` tree (node, and any
+    // cloudflared helper it spawns) dies with us even on paths where the
+    // RunEvent::Exit cleanup never runs: panic, Task Manager kill, logoff.
+    #[cfg(windows)]
+    confine_to_job(&spawned.child);
 
     if let Some(state) = app.try_state::<Backend>() {
         *state.0.lock().unwrap() = Some(spawned.child);
     }
 
     // Reader thread: keeps stdout + stderr pipes open for the backend's whole
-    // lifetime (dropping them early could EPIPE-crash node), and forwards the
-    // first `dsh web: http://...` line to us.
-    let log_path = log_file.clone();
+    // lifetime (dropping them early could EPIPE-crash node), logs both streams,
+    // and forwards the first `dsh web: http://...` line to us.
+    let err_log = log_tx.clone();
     std::thread::spawn(move || {
         let mut stdout = spawned.reader;
         let mut sent = false;
 
         if let Some(err) = stderr {
-            std::thread::spawn(move || {
-                log_backend_stderr(err, &log_path);
-                drop(logged_tx);
-            });
+            std::thread::spawn(move || pump_log(err, err_log, "[err]"));
         } else {
-            drop(logged_tx);
+            drop(err_log);
         }
 
-        let mut line = String::new();
+        // Bytes rather than `read_line`, for the same reason as `pump_log`: one
+        // non-UTF-8 byte from `cmd` would otherwise end the loop and we would
+        // stop watching for the URL.
+        let mut buf = Vec::new();
         loop {
-            line.clear();
-            match stdout.read_line(&mut line) {
+            buf.clear();
+            match stdout.read_until(b'\n', &mut buf) {
                 Ok(0) | Err(_) => break, // backend exited
                 Ok(_) => {
-                    if let Some(url) = extract_url(&line) {
+                    let text = String::from_utf8_lossy(&buf);
+                    let text = text.trim_end();
+                    if !text.is_empty() {
+                        let _ = log_tx.send(format!("[out] {text}"));
+                    }
+                    if let Some(url) = extract_url(text) {
                         if !sent {
                             sent = true;
                             let _ = url_tx.send(url);
@@ -434,6 +455,8 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
                 }
             }
         }
+        // Drop our logger handle so the logger can finish once stderr's is gone.
+        drop(log_tx);
         // Backend exited: notify the waiter so it can act (navigate on success
         // was already handled; on failure report why).
         let _ = url_tx.send(String::new());
@@ -448,15 +471,18 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
             let app = app.clone();
             std::thread::spawn(move || {
                 let _ = url_rx.recv();
-                let _ = app.exit(0);
+                app.exit(0);
             });
             Ok(())
         }
         _ => {
             // Let the logger finish before reading the log, or we summarize a
             // file the backend's own error has not reached yet.
-            let _ = logged_rx.recv_timeout(Duration::from_secs(2));
-            eprintln!("dsh backend never became ready (see log: {})", log_file.display());
+            let _ = log_done.recv_timeout(Duration::from_secs(2));
+            eprintln!(
+                "dsh backend never became ready (see log: {})",
+                log_file.display()
+            );
             let summary = backend_error_summary(&log_file);
             for line in &summary {
                 eprintln!("  {line}");
@@ -480,27 +506,16 @@ fn navigate_to(app: &tauri::AppHandle, url: &str) {
     }
 }
 
-/// Copy the backend's stderr into the log file, one prefixed line at a time.
+/// Forward one of the backend's output streams into the log channel, tagging
+/// each line with `prefix` so `[out]` and `[err]` stay distinguishable after the
+/// two are interleaved into one file.
 ///
 /// Reads bytes rather than `read_line`: on Windows the failure text can come
 /// from `cmd` itself in the console's OEM codepage, and a `String`-based read
-/// errors out on the first such byte and abandons the rest of the log — which is
-/// exactly the case the log exists to explain. Lossy decoding keeps the line.
-fn log_backend_stderr(stderr: std::process::ChildStderr, log_path: &std::path::Path) {
-    use std::io::Write;
-
-    // Truncate per run: the log diagnoses the current launch, and appending
-    // forever would grow unbounded and mix stale errors into the tail we print.
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(log_path);
-    let Ok(mut file) = file else {
-        return;
-    };
-
-    let mut reader = BufReader::new(stderr);
+/// errors out on the first such byte and abandons the rest of the stream — which
+/// is exactly the case the log exists to explain. Lossy decoding keeps the line.
+fn pump_log<R: std::io::Read>(stream: R, log: mpsc::Sender<String>, prefix: &str) {
+    let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -508,11 +523,70 @@ fn log_backend_stderr(stderr: std::process::ChildStderr, log_path: &std::path::P
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 let text = String::from_utf8_lossy(&buf);
-                let _ = writeln!(file, "[dsh] {}", text.trim_end());
-                let _ = file.flush();
+                let text = text.trim_end();
+                if !text.is_empty() && log.send(format!("{prefix} {text}")).is_err() {
+                    break; // logger is gone
+                }
             }
         }
     }
+}
+
+/// Size at which the backend log rolls over to `dsh-backend.log.1`.
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Spawn the single thread that owns the log file. Both output pipes feed it
+/// through the returned sender, so the readers never contend for the handle and
+/// rotation has exactly one owner.
+///
+/// The file is truncated on open, not appended to: the log documents the current
+/// launch, and `backend_error_summary` reads the whole thing — carrying yesterday's
+/// stack traces in would attribute them to this boot. Rotation then bounds growth
+/// within a long-running session, where a chatty backend could otherwise fill the
+/// disk.
+///
+/// The returned receiver disconnects when the thread has written everything it
+/// will ever write, which is how a failure path knows the log is complete.
+fn spawn_logger(path: PathBuf) -> (mpsc::Sender<String>, mpsc::Receiver<()>) {
+    use std::io::Write;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Held only so dropping it on thread exit wakes the waiter.
+        let _done = done_tx;
+        let mut file = open_log(&path, true);
+        let mut size = 0u64;
+
+        for line in rx {
+            if size + line.len() as u64 > LOG_MAX_BYTES {
+                // Close before renaming: Windows will not rename an open file.
+                drop(file.take());
+                let rotated = path.with_extension("log.1");
+                let _ = std::fs::remove_file(&rotated);
+                let _ = std::fs::rename(&path, &rotated);
+                file = open_log(&path, true);
+                size = 0;
+            }
+            if let Some(f) = file.as_mut() {
+                if writeln!(f, "{line}").is_ok() {
+                    let _ = f.flush();
+                    size += line.len() as u64 + 1;
+                }
+            }
+        }
+    });
+    (tx, done_rx)
+}
+
+fn open_log(path: &std::path::Path, truncate: bool) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(truncate)
+        .append(!truncate)
+        .open(path)
+        .ok()
 }
 
 /// Take our backend child out of the state, if we have one.
@@ -661,8 +735,9 @@ fn open_node_site() {
 /// Tray icon (DeepSeek whale) with a menu: show window / quit.
 fn setup_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示 DSH", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "update", "检查更新", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &update, &quit])?;
 
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
 
@@ -678,6 +753,10 @@ fn setup_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()>
                     let _ = window.unminimize();
                     let _ = window.set_focus();
                 }
+            }
+            "update" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move { check_for_update(app).await });
             }
             "quit" => app.exit(0),
             _ => {}
@@ -702,6 +781,108 @@ fn setup_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()>
     Ok(())
 }
 
+/// Put the child into a job object set to kill everything inside it once the
+/// last handle to the job closes. We hold that handle, so however this process
+/// dies -- clean exit, panic, Task Manager, logoff -- Windows reaps the whole
+/// `dsh web` tree. The `RunEvent::Exit` taskkill stays as the graceful path;
+/// this is the backstop for the paths where it never runs.
+///
+/// The job handle is deliberately leaked: it has to stay open for our entire
+/// lifetime, and the OS closing it during process teardown is precisely the
+/// trigger we want.
+#[cfg(windows)]
+fn confine_to_job(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::addr_of!(info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            return;
+        }
+        AssignProcessToJobObject(job, child.as_raw_handle() as _);
+    }
+}
+
+/// Tray-triggered update check. Manual rather than automatic on startup: an
+/// update replaces the running binary and needs a relaunch, so it must not
+/// happen behind the user's back mid-session.
+async fn check_for_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+    use tauri_plugin_updater::UpdaterExt;
+
+    let result = match app.updater() {
+        Ok(updater) => updater.check().await,
+        Err(e) => {
+            let _ = app.dialog().message(format!("更新器初始化失败：{e}"));
+            return;
+        }
+    };
+
+    match result {
+        Ok(Some(update)) => {
+            let version = update.version.clone();
+            let handle = app.clone();
+            app.dialog()
+                .message(format!(
+                    "发现新版本 {version}（当前 {}）。\n更新后应用会自动重启。",
+                    update.current_version
+                ))
+                .title("DSH Desktop 更新")
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "立即更新".into(),
+                    "稍后".into(),
+                ))
+                .show(move |confirmed| {
+                    if !confirmed {
+                        return;
+                    }
+                    tauri::async_runtime::spawn(async move {
+                        match update.download_and_install(|_, _| {}, || {}).await {
+                            // Relaunch into the new binary; the RunEvent::Exit
+                            // handler still runs, so the backend gets reaped.
+                            Ok(()) => handle.restart(),
+                            Err(e) => {
+                                let _ = handle
+                                    .dialog()
+                                    .message(format!("更新失败：{e}"))
+                                    .title("DSH Desktop 更新")
+                                    .blocking_show();
+                            }
+                        }
+                    });
+                });
+        }
+        Ok(None) => {
+            app.dialog()
+                .message("已经是最新版本。")
+                .title("DSH Desktop 更新")
+                .show(|_| {});
+        }
+        Err(e) => {
+            app.dialog()
+                .message(format!("检查更新失败：{e}"))
+                .title("DSH Desktop 更新")
+                .show(|_| {});
+        }
+    }
+}
+
 struct Spawned {
     child: Child,
     reader: BufReader<std::process::ChildStdout>,
@@ -724,8 +905,8 @@ fn probe_existing_web() -> Option<String> {
 
     let port = probe_port();
     let addr = format!("127.0.0.1:{port}");
-    let mut stream = TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(1200))
-        .ok()?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(1200)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
     let _ = write!(
         stream,
@@ -763,9 +944,10 @@ fn spawn_backend() -> std::io::Result<Spawned> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "failed to capture stdout")
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture stdout"))?;
     let stderr = child.stderr.take();
     Ok(Spawned {
         child,
@@ -787,9 +969,7 @@ fn working_dir() -> std::path::PathBuf {
 fn dirs_home() -> std::path::PathBuf {
     #[cfg(windows)]
     {
-        std::path::PathBuf::from(
-            std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()),
-        )
+        std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()))
     }
     #[cfg(not(windows))]
     {
@@ -891,12 +1071,13 @@ fn process_image_matches(pid: u64, pred: impl Fn(&str) -> bool) -> bool {
     let image = if cfg!(windows) {
         // A match is a CSV row starting with the quoted image name; a miss is a
         // localized "no tasks" notice, which never starts with a quote.
-        text.strip_prefix('"').and_then(|rest| rest.split('"').next())
+        text.strip_prefix('"')
+            .and_then(|rest| rest.split('"').next())
     } else {
         Some(text.trim()).filter(|t| !t.is_empty())
     };
 
-    image.is_some_and(|image| pred(image))
+    image.is_some_and(pred)
 }
 
 /// Pull the interesting lines out of the backend log for a startup failure, so
@@ -912,7 +1093,11 @@ fn backend_error_summary(log: &std::path::Path) -> Vec<String> {
     let mut specific = Vec::new();
     let mut generic = Vec::new();
     for line in raw.lines() {
-        let text = line.trim_start_matches("[dsh] ").trim();
+        // Both streams share the file, each line tagged; strip either tag.
+        let text = line
+            .trim_start_matches("[out] ")
+            .trim_start_matches("[err] ")
+            .trim();
         // Error headlines only: stack frames repeat the same cause many times.
         if text.starts_with("at ") || !text.contains("Error") {
             continue;
@@ -932,15 +1117,49 @@ fn backend_error_summary(log: &std::path::Path) -> Vec<String> {
     specific
 }
 
+/// Pull the local GUI URL out of a line of `dsh web` output.
+///
+/// Deliberately strict: the backend prints other URLs too (docs links, a
+/// cloudflared tunnel address, error prose), and navigating to the wrong one
+/// parks the window on something that is not the GUI. We accept only an
+/// `http://` URL that is loopback *and* carries an explicit port -- exactly
+/// what `--port 0` reports -- and keep scanning the line when the first match
+/// does not qualify.
 fn extract_url(line: &str) -> Option<String> {
-    let start = line.find("http://")?;
-    let rest = line[start..].trim();
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    if end == 0 {
-        None
-    } else {
-        Some(rest[..end].to_string())
+    let clean = strip_ansi(line);
+    for (idx, _) in clean.match_indices("http://") {
+        let rest = &clean[idx..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c.is_control())
+            .unwrap_or(rest.len());
+        // Trailing punctuation belongs to the prose, not the URL.
+        let candidate = rest[..end].trim_end_matches(|c| {
+            matches!(
+                c,
+                '.' | ',' | ')' | ']' | '}' | '"' | '\'' | ';' | ':' | '!' | '?'
+            )
+        });
+        let Ok(parsed) = Url::parse(candidate) else {
+            continue;
+        };
+        let loopback = matches!(
+            parsed.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
+        );
+        // Require an explicit :port. `Url::port()` reports None when the port
+        // equals the scheme default (80), so inspect the authority text.
+        let authority = candidate["http://".len()..]
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        let has_port = authority
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+        if parsed.scheme() == "http" && loopback && has_port {
+            return Some(candidate.to_string());
+        }
     }
+    None
 }
 
 /// How long a backend that can actually honor a polite shutdown gets before we
@@ -1012,4 +1231,90 @@ fn run_kill(pid: u32, force: bool) {
     // "process not found" complaint is localized console output that lands as
     // mojibake in the parent terminal. Swallow both streams.
     let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
+/// Strip ANSI CSI escapes (`ESC [ ... final-byte`). `dsh` is a Node CLI and
+/// those routinely colourise URLs; without this the reset code gets glued onto
+/// the end of the address we extract.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() != Some('[') {
+            continue; // stray escape, not a CSI sequence
+        }
+        for c in chars.by_ref() {
+            if ('\x40'..='\x7e').contains(&c) {
+                break; // CSI final byte
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_loopback_with_port() {
+        assert_eq!(
+            extract_url("dsh web: http://127.0.0.1:52341\n").as_deref(),
+            Some("http://127.0.0.1:52341")
+        );
+        assert_eq!(
+            extract_url("  ready on http://localhost:3080/app?x=1 \r\n").as_deref(),
+            Some("http://localhost:3080/app?x=1")
+        );
+    }
+
+    #[test]
+    fn requires_an_explicit_port() {
+        // Without a port we cannot tell the GUI from an unrelated docs link,
+        // and `--port 0` always reports one.
+        assert_eq!(extract_url("see http://localhost/docs"), None);
+    }
+
+    #[test]
+    fn rejects_non_loopback() {
+        assert_eq!(extract_url("tunnel: http://example.com:8080"), None);
+    }
+
+    #[test]
+    fn skips_unqualified_match_and_keeps_scanning() {
+        // The real failure this guards: a docs link printed before the GUI URL
+        // used to win because only the first `http://` was ever considered.
+        assert_eq!(
+            extract_url("docs http://example.com/x then http://127.0.0.1:9001").as_deref(),
+            Some("http://127.0.0.1:9001")
+        );
+    }
+
+    #[test]
+    fn trims_trailing_prose_punctuation() {
+        assert_eq!(
+            extract_url("open (http://127.0.0.1:3080).").as_deref(),
+            Some("http://127.0.0.1:3080")
+        );
+    }
+
+    #[test]
+    fn strips_ansi_colour_codes() {
+        assert_eq!(
+            extract_url("\x1b[32mhttp://127.0.0.1:3080\x1b[0m").as_deref(),
+            Some("http://127.0.0.1:3080")
+        );
+    }
+
+    #[test]
+    fn ignores_lines_without_a_url() {
+        assert_eq!(extract_url("Error: EADDRINUSE"), None);
+        assert_eq!(extract_url(""), None);
+        // https is never the local GUI; we only ever serve plain http.
+        assert_eq!(extract_url("https://127.0.0.1:3080"), None);
+    }
 }
