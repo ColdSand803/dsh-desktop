@@ -165,9 +165,24 @@ fn theme_titlebar(window: &tauri::WebviewWindow, theme: Theme) {
 /// a fallback for a theme that drops the token entirely.
 const THEME_WATCH_JS: &str = r#"
 (function () {
-  // Only the top-level dsh document should report. Without this the shell page
-  // and the iframe would both emit and fight over the title bar colour.
-  if (window.top !== window && !document.body) return;
+  // Only the dsh page reports, and it lives one level down in the shell's
+  // iframe. Two frames run this script:
+  //
+  //   shell  (top-level, our index.html) -- has no dsh tokens to read, so its
+  //          reading is meaningless; it is the thing being coloured.
+  //   dsh    (first-level subframe)      -- the one we actually want.
+  //
+  // Skip anything deeper than one level too: dsh may frame things itself, and a
+  // nested frame reporting would fight the real page over the title bar colour.
+  //
+  // This was `window.top !== window && !document.body`, which was inverted. The
+  // script is injected at document-start, so `document.body` is null in *both*
+  // frames; the shell fell through and reported (finding no token, and sampling
+  // the iframe element's own background back), while dsh returned early and
+  // never reported at all. The bar then sat on the hardcoded default forever --
+  // which happens to match dsh's dark theme, so it looked correct until you
+  // switched to light.
+  if (window.top === window || window.parent !== window.top) return;
 
   function parseRgb(v) {
     if (!v) return null;
