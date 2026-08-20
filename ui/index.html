@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <title>DSH Desktop</title>
@@ -10,18 +10,28 @@
       * {
         box-sizing: border-box;
       }
+      /* NOTE: the host samples this background to decide whether to paint the
+         title bar dark or light (THEME_WATCH_JS in src-tauri/src/main.rs).
+         Keep it dark, or the native chrome stops matching the page. */
       body {
         margin: 0;
         min-height: 100vh;
         display: flex;
         align-items: center;
         justify-content: center;
+        padding: 32px;
         font-family: "Segoe UI", system-ui, sans-serif;
         background: #0f1115;
         color: #e2e8f0;
       }
-      .boot {
+      .view {
+        display: none;
+        width: 100%;
+        max-width: 560px;
         text-align: center;
+      }
+      .view.active {
+        display: block;
       }
       .logo {
         width: 72px;
@@ -35,6 +45,8 @@
         font-weight: 700;
         font-size: 26px;
         color: #fff;
+      }
+      .logo.pulse {
         animation: pulse 1.6s ease-in-out infinite;
       }
       @keyframes pulse {
@@ -48,17 +60,218 @@
           opacity: 0.75;
         }
       }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 19px;
+        font-weight: 600;
+      }
       .text {
         font-size: 15px;
         color: #94a3b8;
         letter-spacing: 0.02em;
+        line-height: 1.6;
+      }
+      .text + .text {
+        margin-top: 8px;
+      }
+      code {
+        font-family: Consolas, "Cascadia Mono", monospace;
+        font-size: 13px;
+        padding: 2px 6px;
+        border-radius: 5px;
+        background: #1b2028;
+        color: #cbd5e1;
+      }
+      .cmd {
+        display: block;
+        margin: 18px 0;
+        padding: 12px 14px;
+        text-align: left;
+      }
+      button {
+        font: inherit;
+        font-size: 14px;
+        padding: 9px 20px;
+        margin: 4px;
+        border: 1px solid #2a3140;
+        border-radius: 8px;
+        background: #1b2028;
+        color: #e2e8f0;
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) {
+        background: #232a35;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      button.primary {
+        border-color: transparent;
+        background: #3c6eff;
+        color: #fff;
+      }
+      button.primary:hover:not(:disabled) {
+        background: #2f5ce0;
+      }
+      .log {
+        margin: 18px 0 14px;
+        padding: 12px;
+        height: 240px;
+        overflow-y: auto;
+        text-align: left;
+        white-space: pre-wrap;
+        word-break: break-all;
+        font-family: Consolas, "Cascadia Mono", monospace;
+        font-size: 12px;
+        line-height: 1.55;
+        color: #9aa7b8;
+        background: #14181f;
+        border: 1px solid #222835;
+        border-radius: 8px;
+      }
+      .detail {
+        margin: 16px 0;
+        padding: 12px 14px;
+        text-align: left;
+        font-family: Consolas, "Cascadia Mono", monospace;
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: #f0b4b4;
+        background: #1d1517;
+        border: 1px solid #3a2327;
+        border-radius: 8px;
       }
     </style>
   </head>
   <body>
-    <div class="boot">
-      <div class="logo">dsh</div>
-      <div class="text">正在启动 DeepSeek Harness…</div>
+    <div class="view active" id="view-booting">
+      <div class="logo pulse">dsh</div>
+      <div class="text" id="boot-text">正在启动 DeepSeek Harness…</div>
     </div>
+
+    <div class="view" id="view-missing-dsh">
+      <div class="logo">dsh</div>
+      <h1>还没有安装 dsh</h1>
+      <div class="text">
+        这个桌面端是 DeepSeek Harness 的外壳，需要本机的 <code>dsh</code> 命令来跑服务。
+        可以现在装上，也可以自己在终端里执行下面这条命令：
+      </div>
+      <code class="cmd">npm install -g @deepseek-ai/dsh</code>
+      <button class="primary" id="btn-install">一键安装</button>
+    </div>
+
+    <div class="view" id="view-installing">
+      <div class="logo pulse">dsh</div>
+      <h1>正在安装 dsh</h1>
+      <div class="text">首次安装要下载几百 MB，慢一点是正常的。</div>
+      <div class="log" id="install-log"></div>
+    </div>
+
+    <div class="view" id="view-missing-node">
+      <div class="logo">dsh</div>
+      <h1>需要先装 Node.js</h1>
+      <div class="text">
+        本机没有找到 <code>npm</code>，所以没法自动装 dsh。
+        先装 Node.js（建议 LTS 版本），装完重开这个应用，就能一键安装 dsh 了。
+      </div>
+      <div class="text">
+        装好 Node.js 后也可以自己执行：<code>npm install -g @deepseek-ai/dsh</code>
+      </div>
+      <button class="primary" id="btn-node">打开 nodejs.org</button>
+    </div>
+
+    <div class="view" id="view-error">
+      <div class="logo">dsh</div>
+      <h1>启动失败</h1>
+      <div class="detail" id="error-detail"></div>
+      <button class="primary" id="btn-retry">重试</button>
+    </div>
+
+    <script>
+      // withGlobalTauri is on (see tauri.conf.json), so the IPC bridge is right
+      // here on window — this page needs no bundler and no npm dependencies.
+      const tauri = window.__TAURI__;
+      const invoke = tauri && tauri.core ? tauri.core.invoke : null;
+
+      const views = {};
+      for (const el of document.querySelectorAll(".view")) {
+        views[el.id.slice("view-".length)] = el;
+      }
+      const bootText = document.getElementById("boot-text");
+      const errorDetail = document.getElementById("error-detail");
+      const logBox = document.getElementById("install-log");
+
+      // Buttons disable themselves while their command runs; remember the
+      // original labels so a view we come back to is usable again.
+      const labels = new Map();
+      for (const btn of document.querySelectorAll("button")) {
+        labels.set(btn, btn.textContent);
+      }
+
+      function show(state, detail) {
+        const view = views[state] || views.booting;
+        for (const el of Object.values(views)) {
+          el.classList.toggle("active", el === view);
+        }
+        for (const [btn, label] of labels) {
+          btn.disabled = false;
+          btn.textContent = label;
+        }
+        const lines = Array.isArray(detail) ? detail : [];
+        if (view === views.booting) {
+          bootText.textContent = lines[0] || "正在启动 DeepSeek Harness…";
+        } else if (view === views.error) {
+          errorDetail.textContent = lines.length
+            ? lines.join("\n")
+            : "没有拿到更多信息。";
+        } else if (view === views.installing) {
+          logBox.textContent = "";
+        }
+      }
+
+      function appendLog(line) {
+        // Stay pinned to the bottom only if the user has not scrolled up to read.
+        const atBottom =
+          logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 24;
+        logBox.textContent += line + "\n";
+        if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+      }
+
+      function wire(id, command, busyLabel) {
+        const btn = document.getElementById(id);
+        btn.addEventListener("click", () => {
+          if (!invoke) return;
+          btn.disabled = true;
+          if (busyLabel) btn.textContent = busyLabel;
+          invoke(command).catch((e) => {
+            btn.disabled = false;
+            show("error", [String(e)]);
+          });
+        });
+      }
+
+      wire("btn-install", "install_dsh", "安装中…");
+      wire("btn-retry", "retry_boot", "重试中…");
+      wire("btn-node", "open_node_site");
+
+      if (tauri && tauri.event) {
+        tauri.event.listen("dsh-status", (e) => {
+          const p = e.payload || {};
+          show(p.state, p.detail);
+        });
+        tauri.event.listen("dsh-install-log", (e) => appendLog(e.payload));
+      }
+      // The host may have settled on a status before this page finished loading,
+      // so ask for the current one instead of waiting for an event that already
+      // fired — otherwise the window could sit on the splash forever.
+      if (invoke) {
+        invoke("current_status")
+          .then((p) => show(p.state, p.detail))
+          .catch(() => {});
+      }
+    </script>
   </body>
 </html>

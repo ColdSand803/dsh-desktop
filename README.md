@@ -9,7 +9,8 @@ DeepSeek Harness (dsh) 的桌面客户端。用 [Tauri v2](https://tauri.app) �
 - **无黑窗口**：spawn 后端与清理进程时都带 `CREATE_NO_WINDOW`，全程无命令行窗口闪现
 - **托盘常驻**：系统托盘显示鲸鱼图标，左键单击唤出窗口；关闭窗口 = 最小化到托盘（后端继续运行）；托盘菜单「退出」彻底退出并清理后端
 - 启动时自动在后台拉起 `dsh web --port 0`（系统自动分配空闲端口），解析后端输出把窗口导航到实际地址
-- 退出时 `taskkill /T /F` 杀掉整个后端进程树（含 cloudflared 等辅助进程），后端日志写入 `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-backend.log`
+- **没装 dsh 也能用**：启动前先探测环境，缺 `dsh` 时窗口停在引导页，可一键 `npm i -g @deepseek-ai/dsh`（日志实时显示），装完自动接着启动；连 npm 都没有则引导去装 Node.js
+- 退出时结束整个后端进程树（含 cloudflared 等辅助进程），Windows 上直接 `taskkill /T /F`。这里没有「先礼后兵」的余地：后端是个无窗口的 `cmd` 套 node，普通 `taskkill /T` 对树里每个进程都只回一句「只能强制终止此任务(带 /F 选项)」，等它等不出结果，只会拖长退出——而退出没完成前单实例锁不释放，「退出后立刻重开」会静默失效。留下的残留由下次启动时的锁清理兜住。后端日志写入 `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-backend.log`
 - 单实例：重复启动只会聚焦已有窗口
 
 ## 环境要求
@@ -18,8 +19,8 @@ DeepSeek Harness (dsh) 的桌面客户端。用 [Tauri v2](https://tauri.app) �
 |---|---|
 | Rust toolchain | `rustup` 安装 stable（>= 1.77） |
 | WebView2 Runtime | Win10/11 一般已内置（`EdgeUpdate` 可查版本） |
-| dsh | `npm i -g @deepseek-ai/dsh`，`dsh` 需在 PATH 中 |
-| Node.js + pnpm/npm | 仅用于 Tauri CLI |
+| dsh | **可选**——没装时应用内可一键安装（`npm i -g @deepseek-ai/dsh`）；已装则需在 PATH 中 |
+| Node.js + pnpm/npm | Tauri CLI 需要；`npm` 同时也是应用内一键安装 dsh 的前提 |
 
 ## 开发
 
@@ -54,8 +55,21 @@ npm run build:no-bundle   # 只编译 exe，不打包安装器
   要真正结束，请用托盘右键菜单的「退出」，或在托盘图标上左键唤回窗口。若希望「关窗即完全退出」，
   把 `main.rs` 中 `RunEvent::WindowEvent ... CloseRequested` 分支删掉即可恢复默认行为。
 
-- **后端生命周期**：后端随应用启动、随应用退出。若 `dsh web` 启动失败（例如 dsh 不在 PATH），
-  窗口会停在启动页并自动退出，详细原因见 `dsh-backend.log`。
+- **后端生命周期**：后端随应用启动、随应用退出。后端自己退出时应用也会跟着退出，不会停在死页面上。
+
+- **没装 dsh 时的引导**：启动前会先探测 `dsh` 是否在 PATH 中，结果分三种——
+
+  | 情况 | 页面表现 |
+  |---|---|
+  | 有 `dsh` | 正常启动，直接进 GUI |
+  | 没 `dsh`、有 `npm` | 说明页 + 「一键安装」按钮，点了就跑 `npm install -g @deepseek-ai/dsh`，日志实时滚动；装完自动接着启动（npm 全局目录本来就在 PATH 上，不用重启） |
+  | 连 `npm` 都没有 | 提示先装 Node.js，带一个「打开 nodejs.org」按钮 |
+
+  首次运行不需要手动初始化 profile——`dsh web` 在全新的 `DSH_HOME` 下会自己把 profile 装起来。
+
+- **启动失败**：不再闪退。窗口会停在错误页，把后端日志里最相关的几行直接显示出来（优先显示指名道姓的
+  `Cannot find ...` 这类，而不是外层笼统的「plugin tree failed to load」），并提供「重试」按钮。
+  完整日志仍在 `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-backend.log`（每次启动覆写）。
 
 ## 图标生成
 
@@ -70,11 +84,11 @@ npm run build:no-bundle   # 只编译 exe，不打包安装器
 
 ```
 dsh-desktop/
-├── ui/                  # 启动占位页（窗口导航到真实 GUI 前显示）
+├── ui/                  # 启动 / 引导页（状态机：启动中、缺 dsh、安装中、缺 Node、出错）
 ├── scripts/
 │   └── gen-icons.js     # 从 DSH favicon.svg 渲染 DeepSeek 鲸鱼图标（应用 + 托盘）
 ├── src-tauri/
-│   ├── src/main.rs      # 核心：拉起后端 / 解析端口 / 导航窗口 / 托盘 / 退出清理
+│   ├── src/main.rs      # 核心：环境探测 / 一键安装 / 拉起后端 / 导航窗口 / 托盘 / 退出清理
 │   ├── Cargo.toml
 │   ├── tauri.conf.json  # 窗口与打包配置
 │   └── icons/           # npx tauri icon 生成的全套图标 + tray.png
@@ -86,3 +100,8 @@ dsh-desktop/
 
 - 未配置开机自启、快捷键等；要加的话在 `main.rs` 和 `tauri.conf.json` 里扩展即可。
 - 未使用 macOS/Linux 深度适配（代码里做了 `sh -c` 分支，理论上可跨平台，但只在 Windows 验证过）。
+- 一键安装走的是系统默认 npm registry，公司内网/需要代理的环境可能装不动——这种情况下按页面上给的
+  命令自己在终端里装（可以先配好 registry 或代理）。
+- Windows 下退出必然是强杀（原因见上），所以**正在装插件时退出应用有损坏 dsh 插件目录的风险**：dsh 用 pnpm 换包时是「先清空目标目录、再把 `<pkg>_tmp_...` 改名盖上去」，强杀正好落在这中间，那个包就只剩一个没有 `package.json` 的 `src/`，下次启动报 `ERR_MODULE_NOT_FOUND`，得重装该包才能恢复。要根治得让后端能优雅退出（Windows 上的正路是 Job Object，或给 `cmd` 发 CTRL_BREAK），目前没做。装插件时请等它装完再退出。
+- Windows 下 `cmd` 自身报的错（比如「不是内部或外部命令」）用的是控制台 OEM 代码页，落进日志会是乱码。
+  加了启动前探测之后基本不会再触发这条路径，暂时没有引入编码转换依赖。
