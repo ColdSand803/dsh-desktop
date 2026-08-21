@@ -836,16 +836,34 @@ fn install_dsh(app: tauri::AppHandle) {
     });
 }
 
+/// Flags for the install, all of them about what the page gets to show.
+///
+/// `--loglevel=http` is the one that matters: npm draws its progress bar only
+/// when stderr is a TTY, and ours is a pipe, so at the default level the install
+/// is silent for the several minutes it spends fetching a few hundred MB — the
+/// log box just sits empty. At `http` npm prints one newline-terminated line per
+/// tarball instead, which streams. A real percentage is not on offer: npm never
+/// reports a total, so per-package lines are as close as we get.
+///
+/// The other two only remove noise we would otherwise have to scroll past: an
+/// audit report and a funding plug, neither of which says anything about whether
+/// the install worked.
+const NPM_INSTALL_FLAGS: [&str; 3] = ["--loglevel=http", "--no-audit", "--no-fund"];
+
 /// Run `npm i -g <DSH_PACKAGE>`, forwarding every output line to the page.
 fn run_install(app: &tauri::AppHandle) -> Result<(), String> {
     let mut cmd = if cfg!(windows) {
         // npm is a .cmd shim, so it needs a shell to run at all.
         let mut c = Command::new("cmd");
-        c.args(["/C", "npm", "install", "-g", DSH_PACKAGE]);
+        c.args(["/C", "npm", "install", "-g"]);
+        c.args(NPM_INSTALL_FLAGS);
+        c.arg(DSH_PACKAGE);
         c
     } else {
         let mut c = Command::new("npm");
-        c.args(["install", "-g", DSH_PACKAGE]);
+        c.args(["install", "-g"]);
+        c.args(NPM_INSTALL_FLAGS);
+        c.arg(DSH_PACKAGE);
         c
     };
     #[cfg(windows)]
@@ -885,8 +903,17 @@ fn run_install(app: &tauri::AppHandle) -> Result<(), String> {
     }
 }
 
-/// Forward one output stream to the page as `dsh-install-log` events. Bytes, not
-/// lines, for the same OEM-codepage reason as `log_backend_stderr`.
+/// Forward one output stream to the page as `dsh-install-log` events. Reads
+/// bytes and decodes lossily rather than going through lines, because on Windows
+/// npm's output arrives in the console's OEM codepage and is not always UTF-8.
+///
+/// Breaks on `\r` as well as `\n`: anything that redraws a line in place (a
+/// progress bar, a spinner) returns the carriage without ever sending a newline,
+/// so a `\n`-only split would hold those bytes in the buffer indefinitely and
+/// release them in one lump at the end. Splitting on both turns each redraw into
+/// its own line — repetitive in the log, but it arrives while it still means
+/// something. `\r\n` flushes on the `\r` and leaves the `\n` looking at an empty
+/// buffer, which `flush` drops, so DOS line endings do not double up.
 fn pump_lines<R: std::io::Read + Send + 'static>(
     app: tauri::AppHandle,
     stream: R,
@@ -894,19 +921,39 @@ fn pump_lines<R: std::io::Read + Send + 'static>(
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stream);
         let mut buf = Vec::new();
-        loop {
+
+        let flush = |buf: &mut Vec<u8>| {
+            let text = String::from_utf8_lossy(buf);
+            let text = text.trim_end();
+            if !text.is_empty() {
+                let _ = app.emit("dsh-install-log", text);
+            }
             buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let text = String::from_utf8_lossy(&buf);
-                    let text = text.trim_end();
-                    if !text.is_empty() {
-                        let _ = app.emit("dsh-install-log", text);
+        };
+
+        loop {
+            // fill_buf/consume rather than a read_until per delimiter: it lets us
+            // scan for either terminator in one pass over the buffered bytes.
+            let (consumed, hit) = match reader.fill_buf() {
+                Ok([]) | Err(_) => break, // EOF, or a stream we can no longer read
+                Ok(available) => match available.iter().position(|&b| b == b'\n' || b == b'\r') {
+                    Some(at) => {
+                        buf.extend_from_slice(&available[..at]);
+                        (at + 1, true) // +1 drops the terminator itself
                     }
-                }
+                    None => {
+                        buf.extend_from_slice(available);
+                        (available.len(), false)
+                    }
+                },
+            };
+            reader.consume(consumed);
+            if hit {
+                flush(&mut buf);
             }
         }
+        // A final line with no terminator still deserves to be shown.
+        flush(&mut buf);
     })
 }
 
@@ -1138,13 +1185,16 @@ fn probe_existing_web() -> Option<String> {
 /// directory, with piped stdout/stderr (stderr goes to a log file).
 fn spawn_backend() -> std::io::Result<Spawned> {
     let cwd = working_dir();
+    // `--no-open`: this window *is* the UI. Left to itself `dsh web` opens the
+    // default browser on every boot, so the same backend ends up on screen twice
+    // — once here, once in a stray tab.
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
-        c.args(["/C", "dsh", "web", "--port", "0"]);
+        c.args(["/C", "dsh", "web", "--port", "0", "--no-open"]);
         c
     } else {
         let mut c = Command::new("sh");
-        c.args(["-c", "dsh web --port 0"]);
+        c.args(["-c", "dsh web --port 0 --no-open"]);
         c
     };
     // No black console window for the spawned cmd.exe on Windows.
