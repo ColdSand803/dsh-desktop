@@ -53,6 +53,79 @@ verified, so CI does not pretend otherwise.
   because turning them on by default is the wrong default and there is no settings
   UI to turn them off. A PR adding one should say how a user disables it.
 
+## Regenerating the icons
+
+The icon source is `favicon.svg` from dsh's frontend package (the DeepSeek whale).
+`scripts/gen-icons.js` renders two things from it:
+
+- `app-icon.png` — 1024×1024, white whale on the brand-blue gradient tile. Feed it
+  to `npx tauri icon` to produce the full set plus `.ico`.
+- `src-tauri/icons/tray.png` — transparent background, blue whale, so it stays
+  visible on a light Windows tray.
+
+```bash
+node scripts/gen-icons.js
+npx tauri icon app-icon.png
+```
+
+The script locates `favicon.svg` itself: `require.resolve` first (dsh installed
+locally), then dsh's global install under `npm root -g`. If neither works it errors
+with the paths it tried. Override explicitly:
+
+```powershell
+$env:DSH_FAVICON = 'C:\path\to\favicon.svg'
+node scripts/gen-icons.js
+```
+
+Committed output is already in the repo, so you only need this if the upstream
+icon changes.
+
+## Releasing
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: build, sign, and open a
+**draft** release with the installer and `latest.json` attached. Review it, then
+publish by hand.
+
+```bash
+# The tag version must match `version` in tauri.conf.json, or the updater will not
+# consider the release newer than what users already have.
+git tag vX.Y.Z && git push --tags
+```
+
+### Signing keys
+
+Updates are signature-verified and an unsigned update is refused, so a fork needs
+its own keypair:
+
+```bash
+npx tauri signer generate -w ~/.tauri/dsh-desktop.key
+```
+
+Put the **public** key in `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`,
+and add one Actions secret, `TAURI_SIGNING_PRIVATE_KEY`, holding the private key
+file's *contents* (not its path).
+
+**If you generated the key without a password, do not create
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` at all.** GitHub rejects empty secret values,
+so you would have to put something in it — and Tauri treats any non-empty value as
+a real password, tries to decrypt with it, and fails:
+
+```
+failed to decode secret key: incorrect updater private key password:
+Wrong password for that key
+```
+
+The failure is easy to misread, and worth knowing about in general: the installer
+is built and reported as built, and only the *signing* step errors afterwards. A
+successful bundle says nothing about whether the release will work. The workflow
+still references the variable; with no such secret it resolves to an empty string,
+which is what a passwordless key needs.
+
+Keep the private key backed up. Lose it and you can never ship an update to
+existing installs again — the public key is already compiled into their binaries,
+so a new keypair silently strands every one of them. Leak it and anyone can push an
+update your users' clients will accept as authentic.
+
 ## Reporting bugs
 
 Include your Windows version, whether `dsh` is on PATH (`where dsh`), and the

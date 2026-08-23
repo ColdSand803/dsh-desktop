@@ -56,39 +56,31 @@ npm run build:no-bundle  # exe only
 Use `npm run dev` rather than `cargo run` inside `src-tauri` — the Tauri CLI
 changes the working directory.
 
-### Releasing (if you fork this)
-
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds, signs, and
-opens a **draft** release. Set one secret: `TAURI_SIGNING_PRIVATE_KEY`, holding the
-*contents* of your minisign private key.
-
-Do **not** create `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` for a key generated without
-a password. GitHub rejects empty secret values, so you would have to put something
-in it — and Tauri treats any non-empty value as a real password, tries to decrypt
-with it, and fails with `Wrong password for that key`. The failure is easy to
-misread: the installer is built successfully and only the *signing* step errors.
-The workflow still references the variable; with no such secret it resolves to an
-empty string, which is what you want.
+Regenerating icons and cutting a release are covered in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## How it works
 
-The window never navigates. It stays on the bundled shell page
-(`ui/index.html`) for its whole life: the shell draws the title bar and hosts the
-dsh GUI in an iframe. That is what allows the title bar to be any colour — a
-native caption cannot be tinted before Windows 11, and this app targets Win10 too.
-
-Theme colours are sampled by a script injected into **every frame**
-(`initialization_script_for_all_frames`), because the shell cannot read across
-origins into the dsh page. The dsh frame reports over a `dsh-theme` event, falling
-back to encoding colours into `document.title` as `[dsh:RRGGBB:RRGGBB]` when the
-event bridge is unavailable.
+The window never navigates. It stays on the bundled shell page (`ui/index.html`)
+for its whole life: the shell draws the title bar and hosts the dsh GUI in an
+iframe. That is what allows the title bar to be any colour — a native caption
+cannot be tinted before Windows 11, and this app targets Win10 too. The sampling
+script is injected into every frame, since the shell cannot read across origins
+into the dsh page; the reasoning is in the comments around `THEME_WATCH_JS` in
+`src-tauri/src/main.rs`.
 
 The backend is spawned as `dsh web --port 0 --no-open` from your home directory
 (override with `DSH_DESKTOP_WORKDIR`), and its stdout is parsed for the local URL.
+Startup first probes port 3080 (`DSH_DESKTOP_PROBE_PORT`) and reuses a `dsh web`
+already serving there — in which case quitting this app leaves that backend
+running, because it is not ours to kill.
 
-For the full behavioural detail — port probing, the guided-install states, log
-rotation, the exit path — see [README.zh.md](README.zh.md), which is the more
-detailed document.
+Behaviour worth knowing as a user: closing the window hides it to the tray and the
+backend keeps serving, so quit from the tray menu to actually stop. The backend log
+is at `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-backend.log` and is **overwritten on
+every launch**, so copy it before restarting if you need it.
+
+[README.zh.md](README.zh.md) is the more detailed document.
 
 ## Known limitations
 

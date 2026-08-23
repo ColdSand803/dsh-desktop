@@ -13,7 +13,8 @@ DeepSeek Harness (dsh) 的桌面客户端。用 [Tauri v2](https://tauri.app) �
 - 启动时先探测 3080 上是否已有 dsh web：有就复用，没有才自己拉起 `dsh web --port 0`（系统分配空闲端口），
   解析后端输出，把实际地址交给外壳页的 iframe（窗口本身不导航，见下）
 - **没装 dsh 也能用**：启动前先探测环境，缺 `dsh` 时窗口停在引导页，可一键 `npm i -g @deepseek-ai/dsh`（日志实时显示），装完自动接着启动；连 npm 都没有则引导去装 Node.js
-- 退出时结束整个后端进程树（含 cloudflared 等辅助进程），Windows 上直接 `taskkill /T /F`。这里没有「先礼后兵」的余地：后端是个无窗口的 `cmd` 套 node，普通 `taskkill /T` 对树里每个进程都只回一句「只能强制终止此任务(带 /F 选项)」，等它等不出结果，只会拖长退出——而退出没完成前单实例锁不释放，「退出后立刻重开」会静默失效。留下的残留由下次启动时的锁清理兜住
+- 退出时结束整个后端进程树（含 cloudflared 等辅助进程）。Windows 上只能强杀，原因和实测见
+  `main.rs` 里 `kill_process_tree` 的注释
 - **异常终止也不残留**：后端子进程被放进 Windows Job Object（`KILL_ON_JOB_CLOSE`），即使桌面端 panic、被任务管理器结束或用户注销，整个 `dsh web` 进程树也会被系统连带回收
 - 单实例：重复启动只会聚焦已有窗口
 
@@ -59,43 +60,6 @@ cargo fmt --check
 只跑 Windows：这个应用本来就是 Windows 目标（DWM 标题栏染色、job object、taskkill），
 非 Windows 的 cfg 分支不是实际会发布的东西。
 
-## 发布
-
-打 tag 触发 `.github/workflows/release.yml`：构建、签名、建一个 **draft** release，
-把安装器和 `latest.json` 传上去。确认无误后手动 publish。
-
-```bash
-# tag 里的版本必须和 tauri.conf.json 的 version 一致，
-# 否则 updater 不会认为这个 release 比用户手上的新。
-git tag v0.1.0 && git push --tags
-```
-
-### 首次发布前必须配的 secret
-
-自动更新靠签名验证，**没有签名的更新会被拒绝**。密钥对已经生成好了，公钥在
-`tauri.conf.json` 的 `plugins.updater.pubkey`，私钥在本地 `~/.tauri/dsh-desktop.key`
-（不在仓库里，`.gitignore` 已覆盖 `*.key` 和 `.tauri/`）。
-
-在 GitHub 仓库 Settings → Secrets and variables → Actions 里，**只加一个**：
-
-| Secret | 值 |
-|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | `~/.tauri/dsh-desktop.key` 的**文件内容**（不是路径） |
-
-**不要建 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。** 这个密钥生成时没设密码，而 GitHub
-不接受空值的 secret——为了把它存进去你只能填点什么（比如一个空格），而 tauri 认为
-「非空就是真密码」，会拿它去解密，然后失败：
-
-```
-failed to decode secret key: incorrect updater private key password: Wrong password for that key
-```
-
-失败的位置容易误导：安装器**已经打出来了**，是之后的签名步骤才报错。`release.yml` 里仍然
-引用了这个变量，secret 不存在时它解析成空字符串，这正是需要的状态。
-
-> 私钥要备份好。**丢了就再也无法给已安装的用户推更新**，只能让他们手动重装；
-> 泄漏了则任何人都能给你的用户推任意更新，而客户端验签会通过。
-
 ## 行为细节
 
 - **工作目录**：进程的工作目录默认取 `USERPROFILE`（dsh 会把运行目录当作默认 workspace 根目录）。
@@ -112,23 +76,17 @@ failed to decode secret key: incorrect updater private key password: Wrong passw
     这样可以避开 task-board 的单实例锁互相冲突。这种情况下退出桌面端**不会**杀掉那个后端——它不归我们管。
   - 没探到，才自己拉起 `dsh web --port 0` 让系统挑空闲端口。
 
-- **标题栏 / 外壳结构**：窗口以 `decorations: false` 创建，整个生命周期都停在 `ui/index.html`
-  这个外壳页上，**从不导航**。外壳自己画标题栏（含最小化 / 最大化 / 关闭，靠 `capabilities/default.json`
-  里的 `core:window:*` 权限），dsh 的 GUI 装在外壳的 iframe 里。
-
-  之所以要这样：原生标题栏只能靠 `DwmSetWindowAttribute` 染色，而那几个属性要 Windows 11。
-  自绘就完全绕开 DWM，Win10 上也准。代价是 GUI 降级成 iframe——如果窗口本身导航到后端地址，
-  自绘的标题栏会跟着那个页面一起消失。
-
-  取色靠 `initialization_script_for_all_frames` 把采样脚本注入到 **iframe 内部**（外壳受同源策略
-  限制，读不到 dsh 页面的颜色），脚本读 `--dsw-specific-sidebar-fill` 后通过 `dsh-theme` 事件上报；
-  事件通道不可用时退化成把颜色编码进 `document.title`（`[dsh:RRGGBB:RRGGBB]`）由宿主轮询。
+- **标题栏 / 外壳结构**：窗口以 `decorations: false` 创建，整个生命周期都停在外壳页
+  `ui/index.html` 上、**从不导航**；标题栏由外壳自己画，dsh 的 GUI 装在外壳的 iframe 里。
+  这样标题栏才能是任意颜色——原生标题栏的染色属性需要 Windows 11。详细原理见 `main.rs`
+  里 `THEME_WATCH_JS` 和窗口创建处的注释。
 
 - **关窗与退出**：点窗口关闭按钮会把窗口隐藏到托盘（后端继续服务），这是桌面常驻应用的常规行为。
   要真正结束，请用托盘右键菜单的「退出」，或在托盘图标上左键唤回窗口。若希望「关窗即完全退出」，
   把 `main.rs` 中 `RunEvent::WindowEvent ... CloseRequested` 分支删掉即可恢复默认行为。
 
-- **后端生命周期**：后端随应用启动、随应用退出。后端自己退出时应用也会跟着退出，不会停在死页面上。
+- **后端生命周期**：后端随应用启动、随应用退出。如果后端自己崩了，应用**不会**跟着消失——
+  会收起 iframe、显示错误页和「重试」按钮。
 
 - **没装 dsh 时的引导**：启动前会先探测 `dsh` 是否在 PATH 中，结果分三种——
 
@@ -145,28 +103,8 @@ failed to decode secret key: incorrect updater private key password: Wrong passw
   完整日志仍在 `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-backend.log`。
 
 - **后端日志**：stdout 和 stderr 都写进 `%LOCALAPPDATA%\com.dsh.desktop\logs\dsh-backend.log`，
-  分别以 `[out]` / `[err]` 前缀区分。每次启动覆写（这个日志是用来解释「这一次」为什么没起来的，
-  追加会把上次的报错混进这次的摘要里）；单次运行内超过 5 MB 会滚动到 `dsh-backend.log.1`（只保留一份）。
-
-- **进程清理**：后端子进程被放进 Windows Job Object（`KILL_ON_JOB_CLOSE`），所以即使桌面端
-  异常终止（panic、任务管理器结束、注销），`dsh web` 整个进程树也会被系统连带回收。
-
-## 图标生成
-
-图标源是 DSH 前端包内的 `favicon.svg`（DeepSeek 鲸鱼，同折叠侧边栏的图标）：
-
-- `app-icon.png` —— 应用图标（1024×1024，品牌蓝渐变圆角底 + 白色鲸鱼），喂给 `npx tauri icon` 生成全套尺寸与 `.ico`
-- `src-tauri/icons/tray.png` —— 托盘图标（透明底 + 品牌蓝鲸鱼，Windows 托盘浅色背景下可见）
-
-重新生成：`node scripts/gen-icons.js` 后执行 `npx tauri icon app-icon.png` 刷新全套图标。
-
-脚本会自己找 `favicon.svg`：先 `require.resolve`（dsh 装在本地时），再查 `npm root -g` 下
-dsh 的全局安装位置。都找不到会报错并列出试过的路径。也可以手动指定：
-
-```powershell
-$env:DSH_FAVICON = 'C:\path\to\favicon.svg'
-node scripts/gen-icons.js
-```
+  分别以 `[out]` / `[err]` 前缀区分。**每次启动覆写**，所以要留证据得在重启前先拷出来；
+  单次运行内超过 5 MB 会滚动到 `dsh-backend.log.1`（只保留一份）。
 
 ## 目录结构
 
@@ -197,17 +135,17 @@ dsh-desktop/
   （这两个都会改变用户可见行为，默认打开不合适，所以留空。）
 - 自动更新是**手动触发**的（托盘「检查更新」），不会在启动时自动查。更新会替换正在运行的
   二进制并需要重启，不该在用户不知情的时候发生。
-- **GUI 跑在 iframe 里**（见上「标题栏」一节的原因）。这条是自绘标题栏的代价，且**尚未在装了 dsh
-  的机器上验证过**：dsh 的前端如果有 frame-busting、依赖 `window.top`、或者自己开新窗口，
-  在 iframe 里可能有异常。真机跑之前请把这条当作未知项。
+- **GUI 跑在 iframe 里**，这是自绘标题栏的代价。目前可用：dsh 没有设 `X-Frame-Options`
+  或 CSP `frame-ancestors`，前端也没有 frame-busting。但这不是它承诺的接口——哪天 dsh 加上
+  这类头，GUI 区域就会白屏。
 - `DWMWA_CAPTION_COLOR` / `TEXT_COLOR` / `BORDER_COLOR` 仍然要 Windows 11（build 22000+），
   Win10 上无害失败。但这**不影响标题栏颜色**——标题栏是自绘的，不经过 DWM；这几个属性现在只用来
   染窗口边框，以及设 `USE_IMMERSIVE_DARK_MODE`。
 - 未使用 macOS/Linux 深度适配（代码里做了 `sh -c` 分支，理论上可跨平台，但只在 Windows 验证过）。
   Job Object 清理是 Windows 专有的，其他平台只有退出时的 `SIGTERM` → `kill -9`。
 - 依赖 `dsh` 的 **stdout 格式**：靠解析 `dsh web: http://127.0.0.1:<port>` 拿地址。
-  dsh 目前是 developer preview（`0.1.0-rc.7`，README 明说会有破坏性变更），
-  哪天改了输出格式，就拿不到地址，会停在外壳页的错误态上。
+  dsh 目前是 developer preview，自己的 README 明说会有破坏性变更——哪天改了输出格式，
+  就拿不到地址，会停在外壳页的错误态上。
 - 一键安装走的是系统默认 npm registry，公司内网/需要代理的环境可能装不动——这种情况下按页面上给的
   命令自己在终端里装（可以先配好 registry 或代理）。
 - Windows 下退出必然是强杀（原因见上），所以**正在装插件时退出应用有损坏 dsh 插件目录的风险**：dsh 用 pnpm 换包时是「先清空目标目录、再把 `<pkg>_tmp_...` 改名盖上去」，强杀正好落在这中间，那个包就只剩一个没有 `package.json` 的 `src/`，下次启动报 `ERR_MODULE_NOT_FOUND`，得重装该包才能恢复。Job Object 只保证「一定收得干净」，不解决「收得优雅」——要根治得让后端能优雅退出（Windows 上的正路是给 `cmd` 发 CTRL_BREAK），目前没做。装插件时请等它装完再退出。
