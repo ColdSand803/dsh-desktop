@@ -431,8 +431,13 @@
           if (url) window.__dshSetFrame(url);
           return;
         }
-        // Any other state means we are not serving a GUI right now.
+        // Any other state means we are not serving a GUI right now. Drop the
+        // remembered src as well as hiding: __dshSetFrame ignores a URL it is
+        // already showing, so a retry that comes back on the same port would
+        // otherwise be treated as a no-op and leave the iframe hidden.
         gui.style.display = "none";
+        gui.removeAttribute("src");
+        delete gui.dataset.src;
         viewsBox.classList.remove("hidden");
 
         const view = views[state] || views.booting;

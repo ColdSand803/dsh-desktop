@@ -618,12 +618,24 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
     match url_rx.recv_timeout(BACKEND_READY_TIMEOUT) {
         Ok(url) if !url.is_empty() => {
             show_gui(app, &url);
-            // When the backend later exits on its own, quit the app so the
-            // window does not sit on a dead page.
+            // Watch for the backend dying under us. This used to call exit(0),
+            // on the reasoning that the window must not sit on a dead page --
+            // which was the only option back when the window navigated *to* the
+            // backend: there was no page of ours left to report on. Now the
+            // window never leaves the shell, so we can hide the iframe and show
+            // the error view with its retry button instead of vanishing
+            // mid-session, which is the worst thing a desktop app can do.
             let app = app.clone();
+            let log_file = log_file.clone();
             std::thread::spawn(move || {
                 let _ = url_rx.recv();
-                app.exit(0);
+                // Let the logger finish before summarizing, or we read a file
+                // the backend's dying words have not reached yet.
+                let _ = log_done.recv_timeout(Duration::from_secs(2));
+                let mut detail = vec!["后端 `dsh web` 意外退出了。".to_string()];
+                detail.extend(backend_error_summary(&log_file));
+                detail.push(format!("完整日志：{}", log_file.display()));
+                emit_status(&app, "error", detail);
             });
             Ok(())
         }
