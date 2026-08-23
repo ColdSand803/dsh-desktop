@@ -56,6 +56,20 @@ npm run build:no-bundle  # exe only
 Use `npm run dev` rather than `cargo run` inside `src-tauri` — the Tauri CLI
 changes the working directory.
 
+### Releasing (if you fork this)
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds, signs, and
+opens a **draft** release. Set one secret: `TAURI_SIGNING_PRIVATE_KEY`, holding the
+*contents* of your minisign private key.
+
+Do **not** create `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` for a key generated without
+a password. GitHub rejects empty secret values, so you would have to put something
+in it — and Tauri treats any non-empty value as a real password, tries to decrypt
+with it, and fails with `Wrong password for that key`. The failure is easy to
+misread: the installer is built successfully and only the *signing* step errors.
+The workflow still references the variable; with no such secret it resolves to an
+empty string, which is what you want.
+
 ## How it works
 
 The window never navigates. It stays on the bundled shell page

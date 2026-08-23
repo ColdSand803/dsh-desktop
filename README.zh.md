@@ -76,15 +76,25 @@ git tag v0.1.0 && git push --tags
 `tauri.conf.json` 的 `plugins.updater.pubkey`，私钥在本地 `~/.tauri/dsh-desktop.key`
 （不在仓库里，`.gitignore` 已覆盖 `*.key` 和 `.tauri/`）。
 
-在 GitHub 仓库 Settings → Secrets and variables → Actions 里加两个：
+在 GitHub 仓库 Settings → Secrets and variables → Actions 里，**只加一个**：
 
 | Secret | 值 |
 |---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | `~/.tauri/dsh-desktop.key` 的**文件内容** |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 空字符串（生成时没设密码） |
+| `TAURI_SIGNING_PRIVATE_KEY` | `~/.tauri/dsh-desktop.key` 的**文件内容**（不是路径） |
+
+**不要建 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。** 这个密钥生成时没设密码，而 GitHub
+不接受空值的 secret——为了把它存进去你只能填点什么（比如一个空格），而 tauri 认为
+「非空就是真密码」，会拿它去解密，然后失败：
+
+```
+failed to decode secret key: incorrect updater private key password: Wrong password for that key
+```
+
+失败的位置容易误导：安装器**已经打出来了**，是之后的签名步骤才报错。`release.yml` 里仍然
+引用了这个变量，secret 不存在时它解析成空字符串，这正是需要的状态。
 
 > 私钥要备份好。**丢了就再也无法给已安装的用户推更新**，只能让他们手动重装；
-> 泄漏了则任何人都能给你的用户推任意更新。
+> 泄漏了则任何人都能给你的用户推任意更新，而客户端验签会通过。
 
 ## 行为细节
 
