@@ -1,0 +1,10 @@
+blank_issues_enabled: true
+contact_links:
+  - name: dsh itself (the backend)
+    url: https://www.npmjs.com/package/@deepseek-ai/dsh
+    about: >-
+      Problems with sessions, models, plugins, or anything inside the GUI belong
+      to DeepSeek Harness. This repo is only the desktop shell that launches it.
+  - name: Security vulnerability
+    url: https://github.com/ColdSand803/dsh-desktop/security/advisories/new
+    about: Report privately, not as a public issue. See SECURITY.md.
