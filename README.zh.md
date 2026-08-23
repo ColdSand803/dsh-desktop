@@ -152,6 +152,12 @@ dsh-desktop/
 - Windows 下 `cmd` 自身报的错（比如「不是内部或外部命令」）用的是控制台 OEM 代码页，落进日志会是乱码。
   加了启动前探测之后基本不会再触发这条路径，暂时没有引入编码转换依赖。
 
+## 链接
+
+- [发行作品](https://github.com/ColdSand803/dsh-desktop/releases)
+- [议题](https://github.com/ColdSand803/dsh-desktop/issues)
+- [Linux.do](https://linux.do/) —— 社区讨论
+
 ## 参与开发
 
 见 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题请走 [SECURITY.md](SECURITY.md) 里的私密上报，不要开公开 issue。

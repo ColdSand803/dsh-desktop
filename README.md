@@ -103,6 +103,12 @@ every launch**, so copy it before restarting if you need it.
 - **One-click install uses your default npm registry.** Behind a corporate proxy
   it may simply fail; install by hand in that case.
 
+## Links
+
+- [Releases](https://github.com/ColdSand803/dsh-desktop/releases)
+- [Issues](https://github.com/ColdSand803/dsh-desktop/issues)
+- [Linux.do](https://linux.do/) — community discussion
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, see
