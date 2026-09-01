@@ -92,6 +92,34 @@ publish by hand.
 git tag vX.Y.Z && git push --tags
 ```
 
+### Channels
+
+A tag whose version carries a prerelease suffix goes to the **alpha** channel; a
+bare one goes to **latest**. The workflow decides by looking for a `-` in the tag.
+
+```bash
+git tag v0.1.1-alpha.1 && git push --tags   # alpha
+git tag v0.1.1         && git push --tags   # latest
+```
+
+The two are published differently, and the difference is load-bearing:
+
+- **latest** relies on GitHub's own `releases/latest/download/` alias, which
+  resolves to the newest release that is neither a draft nor a prerelease. So a
+  stable release is created as a **draft** for review, and users see nothing until
+  you publish it.
+- **alpha** cannot use that alias — skipping prereleases is exactly what it does.
+  Instead the updater points at one permanent prerelease tagged `alpha`, and the
+  workflow overwrites its `latest.json` on every prerelease build. A prerelease is
+  therefore **published outright, not drafted**: the mirror step downloads
+  `latest.json` from it, and a draft's assets are not reachable that way.
+
+The `alpha` release exists only to hold that manifest. Do not delete it, and do not
+publish it as latest — the endpoint is a fixed URL (`SHELL_MANIFESTS` in
+`main.rs`), so a missing one takes the whole alpha channel down. Until the first
+prerelease is pushed, the URL 404s and the panel reports "该通道还没有发布",
+which is the intended empty state rather than an error.
+
 ### Signing keys
 
 Updates are signature-verified and an unsigned update is refused, so a fork needs

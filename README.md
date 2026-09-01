@@ -95,9 +95,34 @@ every launch**, so copy it before restarting if you need it.
 - **Depends on dsh's stdout format.** The GUI address is found by parsing
   `dsh web: http://127.0.0.1:<port>`. dsh is a developer preview and says it will
   make breaking changes; if that line changes, the app stops finding the address.
-- **Updates are manual.** The tray's "检查更新" is the only trigger. An update
-  replaces the running binary and needs a restart, so it should not happen
-  unannounced.
+- **Shell updates are manual.** The tray's "检查桌面端更新" is the only trigger. An
+  update replaces the running binary and needs a restart, so it should not happen
+  unannounced. The title bar's 检查更新 button is the other trigger.
+- **dsh updates are checked, never applied silently.** One `npm view` after each
+  boot (through your own registry config); a newer version only lights up a pill in
+  the title bar. Upgrading replaces the files the running backend executes from, so
+  it takes a click: the app stops the backend it owns, reinstalls, and boots again.
+  A `dsh web` this app does not own — a browser tab's — holds those files open, so
+  the upgrade refuses rather than corrupting it.
+- **Updating with the GUI open asks twice.** Stopping the backend is a force kill,
+  so anything the model was part-way through is cut off — and there is no promised
+  way to ask dsh whether an agent is running, so the app does not pretend to know.
+  With a session on screen the action button arms first and states what will
+  happen; with no GUI up there is nothing to interrupt and it goes straight
+  through.
+- **Two channels, picked per side** (latest / alpha) in the title bar's update
+  panel. For dsh they are npm dist-tags; for the shell they are two updater
+  manifests — `alpha` is a fixed prerelease tag (see
+  `.github/workflows/release.yml`) and honestly reports "nothing published" until
+  the first prerelease exists. The choice lives in `channels.json`, which is what
+  the startup check reads.
+- **Channels can be switched backwards**, and the resolved version number is what
+  gets installed, never a tag. When a channel is behind what you have, the button
+  becomes a rollback; for dsh it first copies `~/.dsh` to
+  `~/.dsh.bak-<version>-<timestamp>` and aborts if that fails. **State is not
+  migrated backwards** — `task-board/ledger-v2.json`, `storages/` and
+  `settings.yaml` are all versioned, and an older dsh may not read what a newer one
+  wrote.
 - **No autostart or global hotkeys.** Both change user-visible behaviour, and
   there is no settings UI to turn them off, so neither is enabled.
 - **One-click install uses your default npm registry.** Behind a corporate proxy

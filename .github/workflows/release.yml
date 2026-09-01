@@ -3,6 +3,9 @@ name: Release
 # Tag-driven: `git tag v0.1.0 && git push --tags` builds, signs and publishes.
 # The tag version must match `version` in tauri.conf.json, otherwise the updater
 # will not consider the release newer than what users already have.
+# A tag carrying a prerelease suffix (`v0.1.1-alpha.1`) is published as a GitHub
+# prerelease and additionally mirrored to the fixed `alpha` tag, which is the
+# updater's alpha channel endpoint. See the mirror step at the bottom.
 on:
   push:
     tags: ["v*"]
@@ -31,6 +34,18 @@ jobs:
 
       - run: npm ci
 
+      # A tag like v0.1.1-alpha.1 is a prerelease; a bare v0.1.1 is not. Used
+      # below to decide both how the release is published and whether the alpha
+      # channel gets updated.
+      - id: channel
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_name }}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -42,8 +57,42 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: DSH Desktop ${{ github.ref_name }}
-          releaseDraft: true
-          prerelease: false
+          # A prerelease is published outright rather than drafted: the alpha
+          # mirror below downloads latest.json from it, and assets of a draft are
+          # not reachable that way. Stable releases stay drafts so they can be
+          # reviewed before users see them.
+          releaseDraft: ${{ steps.channel.outputs.prerelease == 'false' }}
+          prerelease: ${{ steps.channel.outputs.prerelease }}
           # createUpdaterArtifacts is on in tauri.conf.json, so this also emits
           # and uploads latest.json -- the file the updater endpoint fetches.
           args: ""
+
+      # The alpha channel's endpoint is a fixed URL
+      # (releases/download/alpha/latest.json), because GitHub's own
+      # `releases/latest/` alias deliberately skips prereleases -- which is what
+      # keeps stable users off the alpha line, and also what makes a per-tag URL
+      # useless to the updater. So the manifest is mirrored to one permanent
+      # prerelease named `alpha`, overwritten on every prerelease build.
+      #
+      # Downloaded from the release just published rather than reaching into the
+      # build tree: the bundler's output path depends on target and version, and
+      # this way the mirrored file is byte-for-byte the one users get.
+      - name: Mirror latest.json to the alpha channel
+        if: steps.channel.outputs.prerelease == 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "${{ github.ref_name }}" \
+            --pattern latest.json --dir alpha-manifest --clobber
+          # The holder release must exist and must not be a draft, or its assets
+          # are not downloadable. Creating it is idempotent per run: it only
+          # exists once, and every later prerelease just replaces the asset.
+          if ! gh release view alpha >/dev/null 2>&1; then
+            gh release create alpha \
+              --prerelease \
+              --title "Alpha channel manifest" \
+              --notes "Updater manifest for the alpha channel. Points at the newest prerelease; not a release itself."
+          fi
+          gh release upload alpha alpha-manifest/latest.json --clobber

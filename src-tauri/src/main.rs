@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -26,7 +26,27 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Holds the spawned `dsh web` backend so we can kill it on exit. Empty when we
 /// have no backend of our own — either none started yet, or we are reusing one
 /// somebody else owns (a `dsh web` already serving in a browser tab).
-struct Backend(Mutex<Option<Child>>);
+///
+/// `generation` counts how many backends we have retired, and exists to tell
+/// "the backend died on its own" apart from "we killed it on purpose". Both look
+/// identical from the reader thread — stdout hits EOF either way — so without
+/// this, every deliberate replacement (retry button, upgrade, exit) reported
+/// itself to the user as an unexpected crash. `take_backend` bumps it; each
+/// watcher remembers the generation it was born into and stays quiet once it is
+/// no longer the current one. See the watcher in `try_boot`.
+struct Backend {
+    child: Mutex<Option<Child>>,
+    generation: AtomicU64,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self {
+            child: Mutex::new(None),
+            generation: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Guards against two boot sequences running at once (double-clicked retry, or a
 /// retry landing while the install-triggered boot is still going).
@@ -37,12 +57,100 @@ struct BootLock(AtomicBool);
 /// the splash forever having missed the one event that mattered.
 struct Status(Mutex<serde_json::Value>);
 
+/// Last dsh version comparison, cached for the same reason `Status` is: the
+/// check runs on its own thread well after the page has loaded, so a page that
+/// reloads afterwards would otherwise never learn an update is waiting.
+///
+/// `auto_checked` keeps the automatic check to once per session — `boot_sequence`
+/// can run several times (install, retry button) and each pass would otherwise
+/// spend another registry round trip to learn the same thing.
+struct DshVersion {
+    payload: Mutex<serde_json::Value>,
+    auto_checked: AtomicBool,
+}
+
+impl Default for DshVersion {
+    fn default() -> Self {
+        Self {
+            payload: Mutex::new(version_payload(
+                "unknown",
+                DEFAULT_CHANNEL,
+                None,
+                None,
+                None,
+            )),
+            auto_checked: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Same idea as `DshVersion`, for this binary's own update check. No
+/// `auto_checked`: the shell check never runs on its own, only when asked.
+struct ShellVersion {
+    payload: Mutex<serde_json::Value>,
+}
+
+impl Default for ShellVersion {
+    fn default() -> Self {
+        Self {
+            payload: Mutex::new(version_payload(
+                "unknown",
+                DEFAULT_CHANNEL,
+                None,
+                None,
+                None,
+            )),
+        }
+    }
+}
+
 /// The package that provides the `dsh` command, and the site to send users to
 /// when they have no Node.js at all. Both are constants: `install_dsh` and
 /// `open_node_site` take no arguments from the page, so it cannot talk us into
 /// installing an arbitrary package or opening an arbitrary URL.
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 const NODE_SITE: &str = "https://nodejs.org/";
+
+/// Release channels the update panel offers, for both the shell and dsh. For dsh
+/// these are npm dist-tags; for the shell they select an updater manifest (see
+/// `SHELL_MANIFESTS`).
+const CHANNELS: [&str; 2] = ["latest", "alpha"];
+const DEFAULT_CHANNEL: &str = "latest";
+
+/// Map whatever the page sent to one of `CHANNELS`, falling back to the default.
+///
+/// A fixed allowlist rather than a free string because the dsh side interpolates
+/// this into an `npm view` command line. Returning `&'static str` is what makes
+/// that safe by construction: nothing downstream can see a value that did not
+/// come from the table above.
+fn normalize_channel(raw: &str) -> &'static str {
+    let raw = raw.trim();
+    CHANNELS
+        .iter()
+        .copied()
+        .find(|c| c.eq_ignore_ascii_case(raw))
+        .unwrap_or(DEFAULT_CHANNEL)
+}
+
+/// The channel selected for each side, and the file it is remembered in.
+///
+/// Kept host-side rather than in the page's localStorage because the startup dsh
+/// check — the one that lights up the title bar pill — runs before the page can
+/// say anything, and it has to check the channel the user actually follows. The
+/// tray's check reads it for the same reason.
+struct Channels {
+    dsh: Mutex<&'static str>,
+    shell: Mutex<&'static str>,
+}
+
+impl Default for Channels {
+    fn default() -> Self {
+        Self {
+            dsh: Mutex::new(DEFAULT_CHANNEL),
+            shell: Mutex::new(DEFAULT_CHANNEL),
+        }
+    }
+}
 
 /// How long we wait for `dsh web` to print its URL before calling it a failure.
 const BACKEND_READY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -325,7 +433,15 @@ fn main() {
         }))
         .invoke_handler(tauri::generate_handler![
             current_status,
+            current_dsh_version,
+            current_shell_version,
+            current_channels,
+            set_channel,
+            check_dsh_update,
+            check_shell_update,
+            update_shell,
             install_dsh,
+            upgrade_dsh,
             retry_boot,
             open_node_site
         ])
@@ -386,9 +502,15 @@ fn main() {
             // The backend slot starts empty and is filled by boot_sequence once
             // we actually own a child. It stays empty when we reuse a dsh we did
             // not start (see try_boot): exiting must not kill the browser's dsh.
-            app.manage(Backend(Mutex::new(None)));
+            app.manage(Backend::default());
             app.manage(BootLock(AtomicBool::new(false)));
             app.manage(Status(Mutex::new(status_payload("booting", Vec::new()))));
+            app.manage(DshVersion::default());
+            app.manage(ShellVersion::default());
+            // Before the boot thread starts: its automatic dsh check has to look
+            // at the channel the user actually follows, not the default.
+            app.manage(Channels::default());
+            load_channels(&handle);
 
             // Boot in the background. This used to block `setup` for up to 90s
             // waiting on the backend URL, which froze the webview — and the boot
@@ -447,6 +569,31 @@ fn current_status(app: tauri::AppHandle) -> serde_json::Value {
     app.try_state::<Status>()
         .map(|s| s.0.lock().unwrap().clone())
         .unwrap_or_else(|| status_payload("booting", Vec::new()))
+}
+
+/// Whether the backend now serving is one we started, as opposed to one we found
+/// already running on the probe port and reused.
+///
+/// Decides two things that both hinge on it: whether we may replace the files it
+/// is executing from (`upgrade_dsh_now`), and whether stopping ours costs the user
+/// anything (the page's update confirmation). `try_boot` stores the child before
+/// it waits for the URL, so this is already true by the time the GUI is shown.
+fn backend_is_ours(app: &tauri::AppHandle) -> bool {
+    app.try_state::<Backend>()
+        .is_some_and(|s| s.child.lock().unwrap().is_some())
+}
+
+/// Whether the window is currently showing the dsh GUI, read off the last status
+/// we pushed — which is by definition what the page is displaying.
+///
+/// Used to decide whether an error may take over the content area. Replacing a
+/// working GUI (possibly with a session in it) with an error page is a heavy
+/// answer to "the update check failed"; when the GUI is up, the update panel
+/// reports the failure itself and the iframe is left alone.
+fn gui_is_up(app: &tauri::AppHandle) -> bool {
+    app.try_state::<Status>()
+        .map(|s| s.0.lock().unwrap()["state"] == "ready")
+        .unwrap_or(false)
 }
 
 /// Why we cannot start a backend right now, if we cannot.
@@ -511,6 +658,374 @@ fn boot_sequence(app: tauri::AppHandle) {
     if let Some(lock) = app.try_state::<BootLock>() {
         lock.0.store(false, Ordering::SeqCst);
     }
+
+    // Once the app is usable, find out whether the dsh it just started is
+    // current. Deliberately after the boot rather than before it: the check
+    // costs a registry round trip, and a slow or unreachable registry must not
+    // delay the thing the user actually asked for. Nothing is installed
+    // automatically — see `auto_check_dsh_version`.
+    auto_check_dsh_version(&app);
+}
+
+/// Where the selected channels are remembered between sessions.
+fn channels_file(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_config_dir().ok()?;
+    Some(dir.join("channels.json"))
+}
+
+/// Load the remembered channels into the managed state. Every value read back is
+/// pushed through `normalize_channel`, so a hand-edited or corrupt file degrades
+/// to the default instead of reaching a command line.
+fn load_channels(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<Channels>() else {
+        return;
+    };
+    let Some(text) = channels_file(app).and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    if let Some(c) = value.get("dsh").and_then(|v| v.as_str()) {
+        *state.dsh.lock().unwrap() = normalize_channel(c);
+    }
+    if let Some(c) = value.get("shell").and_then(|v| v.as_str()) {
+        *state.shell.lock().unwrap() = normalize_channel(c);
+    }
+}
+
+fn save_channels(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<Channels>() else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "dsh": *state.dsh.lock().unwrap(),
+        "shell": *state.shell.lock().unwrap(),
+    });
+    let Some(path) = channels_file(app) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Best effort: losing the preference costs one wrong default next launch,
+    // which is not worth interrupting the user over.
+    let _ = std::fs::write(path, payload.to_string());
+}
+
+fn dsh_channel(app: &tauri::AppHandle) -> &'static str {
+    app.try_state::<Channels>()
+        .map(|s| *s.dsh.lock().unwrap())
+        .unwrap_or(DEFAULT_CHANNEL)
+}
+
+fn shell_channel(app: &tauri::AppHandle) -> &'static str {
+    app.try_state::<Channels>()
+        .map(|s| *s.shell.lock().unwrap())
+        .unwrap_or(DEFAULT_CHANNEL)
+}
+
+/// Remember the channel the panel switched to. `which` picks the side; anything
+/// else is ignored rather than erroring, since the page is the only caller.
+#[tauri::command]
+fn set_channel(app: tauri::AppHandle, which: String, channel: String) {
+    let channel = normalize_channel(&channel);
+    let Some(state) = app.try_state::<Channels>() else {
+        return;
+    };
+    match which.as_str() {
+        "dsh" => *state.dsh.lock().unwrap() = channel,
+        "shell" => *state.shell.lock().unwrap() = channel,
+        _ => return,
+    }
+    save_channels(&app);
+}
+
+/// The panel asks for this on open, so its two selects start on the right values.
+#[tauri::command]
+fn current_channels(app: tauri::AppHandle) -> serde_json::Value {
+    serde_json::json!({
+        "dsh": dsh_channel(&app),
+        "shell": shell_channel(&app),
+        "available": CHANNELS,
+    })
+}
+
+/// The startup version check: run at most once per session, report the result to
+/// the page, and never act on it. An update that replaces `dsh` under a running
+/// backend has to be the user's decision, so this only lights up the title bar's
+/// pill; the upgrade itself goes through `upgrade_dsh`.
+fn auto_check_dsh_version(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<DshVersion>() else {
+        return;
+    };
+    // Nothing to compare against until dsh exists. Checked before the flag is
+    // consumed, so the pass that follows a first-time install still gets its
+    // chance -- otherwise the "missing dsh" boot would burn the one check.
+    if !has_command("dsh") {
+        return;
+    }
+    if state.auto_checked.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let channel = dsh_channel(app);
+    emit_dsh_version(app, "checking", channel, None, None, None);
+    let result = check_dsh_version(channel);
+    report_dsh_version(app, &result);
+}
+
+/// Where a channel's version sits relative to what is installed.
+///
+/// `Older` exists because switching channels is a supported move: going from an
+/// alpha back to the stable line is a downgrade, and the panel has to be able to
+/// offer it rather than reporting "already current" and refusing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VersionRelation {
+    Same,
+    Newer,
+    Older,
+}
+
+impl VersionRelation {
+    /// The `state` string the page switches on.
+    fn state(self) -> &'static str {
+        match self {
+            VersionRelation::Same => "current",
+            VersionRelation::Newer => "outdated",
+            VersionRelation::Older => "rollback",
+        }
+    }
+}
+
+/// Compare a channel's version against the installed one.
+fn relate(target: &str, installed: &str) -> VersionRelation {
+    match compare_versions(target, installed) {
+        std::cmp::Ordering::Greater => VersionRelation::Newer,
+        std::cmp::Ordering::Less => VersionRelation::Older,
+        std::cmp::Ordering::Equal => VersionRelation::Same,
+    }
+}
+
+/// What the version check found. Only `Compared { relation: Newer }` lights up
+/// the title bar pill; everything else is for the panel to render.
+enum VersionCheck {
+    /// Both versions are known and were compared.
+    Compared {
+        installed: String,
+        channel: &'static str,
+        target: String,
+        relation: VersionRelation,
+    },
+    /// The registry answered, but this channel has nothing published under it.
+    ChannelEmpty {
+        installed: String,
+        channel: &'static str,
+    },
+    /// dsh is not installed, so there is nothing to compare.
+    NotInstalled,
+    /// The check itself failed (no npm, no network, unparseable output).
+    Failed {
+        installed: Option<String>,
+        channel: &'static str,
+        reason: String,
+    },
+}
+
+/// Ask the local dsh for its version and the registry for what `channel` points
+/// at, and compare them.
+///
+/// Blocking, and slow enough to matter (two process spawns, one of them network
+/// bound), so every caller runs it off the UI thread.
+fn check_dsh_version(channel: &'static str) -> VersionCheck {
+    if !has_command("dsh") {
+        return VersionCheck::NotInstalled;
+    }
+    let installed = match installed_dsh_version() {
+        Some(v) => v,
+        None => {
+            return VersionCheck::Failed {
+                installed: None,
+                channel,
+                reason: "无法确定本机 dsh 的版本（`dsh --version` 没有输出可识别的版本号）。"
+                    .into(),
+            }
+        }
+    };
+    if !has_command("npm") {
+        return VersionCheck::Failed {
+            installed: Some(installed),
+            channel,
+            reason: "PATH 中没有 npm，无法查询最新版本。".into(),
+        };
+    }
+    let tags = match dsh_dist_tags() {
+        Some(t) => t,
+        None => {
+            return VersionCheck::Failed {
+                installed: Some(installed),
+                channel,
+                reason: format!(
+                    "无法从 npm 查询 {DSH_PACKAGE} 的版本信息，通常是网络或注册表配置问题。"
+                ),
+            }
+        }
+    };
+    match channel_dsh_version(&tags, channel) {
+        ChannelLookup::Version(target) => {
+            let relation = relate(&target, &installed);
+            VersionCheck::Compared {
+                installed,
+                channel,
+                target,
+                relation,
+            }
+        }
+        ChannelLookup::Missing => VersionCheck::ChannelEmpty { installed, channel },
+        ChannelLookup::Failed => VersionCheck::Failed {
+            installed: Some(installed),
+            channel,
+            reason: format!("{DSH_PACKAGE} 的 {channel} 通道返回了无法识别的版本号。"),
+        },
+    }
+}
+
+/// Cache a check result and push it to the page.
+fn report_dsh_version(app: &tauri::AppHandle, result: &VersionCheck) {
+    match result {
+        VersionCheck::Compared {
+            installed,
+            channel,
+            target,
+            relation,
+        } => emit_dsh_version(
+            app,
+            relation.state(),
+            channel,
+            Some(installed),
+            Some(target),
+            None,
+        ),
+        VersionCheck::ChannelEmpty { installed, channel } => {
+            emit_dsh_version(app, "channel-empty", channel, Some(installed), None, None)
+        }
+        VersionCheck::NotInstalled => {
+            emit_dsh_version(app, "not-installed", dsh_channel(app), None, None, None)
+        }
+        VersionCheck::Failed {
+            installed,
+            channel,
+            reason,
+        } => emit_dsh_version(
+            app,
+            "error",
+            channel,
+            installed.as_deref(),
+            None,
+            Some(reason),
+        ),
+    }
+}
+
+/// Shape of the `dsh-version` and `shell-version` events; `state` is what the
+/// page switches on. `target` is the version the selected channel points at,
+/// which may be older than `installed` when the channel was just switched.
+fn version_payload(
+    state: &str,
+    channel: &str,
+    installed: Option<&str>,
+    target: Option<&str>,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "state": state,
+        "channel": channel,
+        "installed": installed,
+        "target": target,
+        "reason": reason,
+    })
+}
+
+/// `(installed, target)` from the last dsh report, for statuses emitted before a
+/// fresh check has run. Both are `None` before the first check.
+fn cached_dsh_versions(app: &tauri::AppHandle) -> (Option<String>, Option<String>) {
+    let field = |p: &serde_json::Value, k: &str| p[k].as_str().map(str::to_string);
+    app.try_state::<DshVersion>()
+        .map(|s| {
+            let p = s.payload.lock().unwrap();
+            (field(&p, "installed"), field(&p, "target"))
+        })
+        .unwrap_or((None, None))
+}
+
+fn emit_dsh_version(
+    app: &tauri::AppHandle,
+    state: &str,
+    channel: &str,
+    installed: Option<&str>,
+    target: Option<&str>,
+    reason: Option<&str>,
+) {
+    eprintln!("dsh version: {state} on {channel} (installed {installed:?}, target {target:?})");
+    let payload = version_payload(state, channel, installed, target, reason);
+    if let Some(store) = app.try_state::<DshVersion>() {
+        *store.payload.lock().unwrap() = payload.clone();
+    }
+    let _ = app.emit("dsh-version", payload);
+}
+
+/// The channel target from the last shell report. The installed version needs no
+/// cache — it is `package_info()`.
+fn cached_shell_target(app: &tauri::AppHandle) -> Option<String> {
+    app.try_state::<ShellVersion>().and_then(|s| {
+        s.payload.lock().unwrap()["target"]
+            .as_str()
+            .map(str::to_string)
+    })
+}
+
+fn emit_shell_version(
+    app: &tauri::AppHandle,
+    state: &str,
+    channel: &str,
+    installed: Option<&str>,
+    target: Option<&str>,
+    reason: Option<&str>,
+) {
+    eprintln!("shell version: {state} on {channel} (installed {installed:?}, target {target:?})");
+    let payload = version_payload(state, channel, installed, target, reason);
+    if let Some(store) = app.try_state::<ShellVersion>() {
+        *store.payload.lock().unwrap() = payload.clone();
+    }
+    let _ = app.emit("shell-version", payload);
+}
+
+/// The page asks for these on load, in case it missed the events.
+#[tauri::command]
+fn current_dsh_version(app: tauri::AppHandle) -> serde_json::Value {
+    app.try_state::<DshVersion>()
+        .map(|s| s.payload.lock().unwrap().clone())
+        .unwrap_or_else(|| version_payload("unknown", DEFAULT_CHANNEL, None, None, None))
+}
+
+#[tauri::command]
+fn current_shell_version(app: tauri::AppHandle) -> serde_json::Value {
+    app.try_state::<ShellVersion>()
+        .map(|s| s.payload.lock().unwrap().clone())
+        .unwrap_or_else(|| version_payload("unknown", DEFAULT_CHANNEL, None, None, None))
+}
+
+/// Run a dsh check for `channel` off the UI thread and report it.
+///
+/// A plain thread rather than the async runtime: the check shells out twice and
+/// blocks, which would stall other tasks on that runtime.
+#[tauri::command]
+fn check_dsh_update(app: tauri::AppHandle, channel: String) {
+    let channel = normalize_channel(&channel);
+    std::thread::spawn(move || {
+        emit_dsh_version(&app, "checking", channel, None, None, None);
+        let result = check_dsh_version(channel);
+        report_dsh_version(&app, &result);
+    });
 }
 
 /// The boot sequence proper. `Err` carries lines to show the user verbatim.
@@ -544,6 +1059,13 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
         }
     }
 
+    // Past the checks, so there is now something to start. The page opens on
+    // "正在检查运行环境…" because up to this line that is all we were doing:
+    // claiming to start DeepSeek Harness while the very next thing we might do
+    // is report that dsh is not installed reads as a lie in the one case where
+    // the wording matters. Say "starting" only once it is true.
+    emit_status(app, "booting", vec!["正在启动 DeepSeek Harness…".into()]);
+
     // A backend we killed on a previous exit never got to release the task-board
     // ledger lock; drop it now or the plugin tree refuses to load. See
     // clear_stale_task_board_lock.
@@ -566,8 +1088,13 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
     #[cfg(windows)]
     confine_to_job(&spawned.child);
 
+    // Read the generation while we store the child: `take_backend` above already
+    // retired whatever came before, so this is the number our own watcher has to
+    // match. Zero when the state is missing, which only happens in tests.
+    let mut generation = 0;
     if let Some(state) = app.try_state::<Backend>() {
-        *state.0.lock().unwrap() = Some(spawned.child);
+        *state.child.lock().unwrap() = Some(spawned.child);
+        generation = state.generation.load(Ordering::SeqCst);
     }
 
     // Reader thread: keeps stdout + stderr pipes open for the backend's whole
@@ -628,7 +1155,20 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
             let app = app.clone();
             let log_file = log_file.clone();
             std::thread::spawn(move || {
-                let _ = url_rx.recv();
+                if !wait_for_backend_exit(&url_rx) {
+                    return;
+                }
+                // EOF also happens when *we* kill the backend -- retry button,
+                // dsh upgrade, app exit. Those are not crashes and must not
+                // raise an error view: on the upgrade path the replacement is
+                // usually already serving by now, so this would paint "启动失败"
+                // over a working GUI. `take_backend` bumped the generation on
+                // its way out, so a stale watcher can tell and leave quietly.
+                if let Some(state) = app.try_state::<Backend>() {
+                    if state.generation.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                }
                 // Let the logger finish before summarizing, or we read a file
                 // the backend's dying words have not reached yet.
                 let _ = log_done.recv_timeout(Duration::from_secs(2));
@@ -658,6 +1198,26 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
     }
 }
 
+/// Block until the reader thread says the backend's stdout reached EOF.
+///
+/// Two kinds of message travel this channel and only one of them means "gone":
+/// a URL (the reader matched a `dsh web: http://...` line) and the empty string
+/// (EOF, so the process is finished writing). Only the first URL is forwarded
+/// today, but reading *any* message as an exit would turn a second address line
+/// into a phantom crash, so skip everything non-empty.
+///
+/// `false` means the sender was dropped without an EOF ever arriving, which is
+/// an absence of news rather than a death — say nothing.
+fn wait_for_backend_exit(rx: &mpsc::Receiver<String>) -> bool {
+    loop {
+        match rx.recv() {
+            Ok(line) if !line.is_empty() => continue,
+            Ok(_) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
 /// Point the shell's iframe at the backend GUI.
 ///
 /// The window itself is never navigated: it has to stay on our page so the
@@ -681,7 +1241,23 @@ fn show_gui(app: &tauri::AppHandle, url: &str) {
     // Cache it as the current status too. The window no longer navigates, so
     // the shell page can be reloaded while the GUI is up; without this it would
     // ask for the status, be told "booting", and sit on the splash forever.
-    emit_status(app, "ready", vec![parsed.as_str().to_string()]);
+    //
+    // The second element says whether this backend is ours. The update panel needs
+    // it to be accurate about what an update costs: stopping ours interrupts
+    // whatever it was doing, while a reused one in a browser tab is untouched by a
+    // shell restart and refuses a dsh upgrade outright.
+    emit_status(
+        app,
+        "ready",
+        vec![
+            parsed.as_str().to_string(),
+            if backend_is_ours(app) {
+                "owned".into()
+            } else {
+                "foreign".into()
+            },
+        ],
+    );
 
     let js = format!(
         "window.__dshSetFrame && window.__dshSetFrame({})",
@@ -813,10 +1389,17 @@ fn open_log(path: &std::path::Path, truncate: bool) -> Option<std::fs::File> {
         .ok()
 }
 
-/// Take our backend child out of the state, if we have one.
+/// Take our backend child out of the state, if we have one, and kill it.
+///
+/// Bumps `generation` before killing so the watcher this child's death is about
+/// to wake can tell it was retired on purpose and keep quiet. The bump happens
+/// even when there is no child to take: a caller that finds the slot empty may
+/// still be about to replace a backend we do not own, and a stale watcher must
+/// not outlive that either.
 fn take_backend(app: &tauri::AppHandle) -> Option<Child> {
-    let child = app.try_state::<Backend>()?.0.lock().unwrap().take();
-    let mut child = child?;
+    let state = app.try_state::<Backend>()?;
+    state.generation.fetch_add(1, Ordering::SeqCst);
+    let mut child = state.child.lock().unwrap().take()?;
     kill_process_tree(child.id());
     let _ = child.kill();
     let _ = child.wait();
@@ -833,7 +1416,8 @@ fn take_backend(app: &tauri::AppHandle) -> Option<Child> {
 fn install_dsh(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         emit_status(&app, "installing", Vec::new());
-        match run_install(&app) {
+        // The bare package name: a first install just follows the default tag.
+        match run_install(&app, DSH_PACKAGE) {
             Ok(()) if has_command("dsh") => {
                 emit_status(&app, "booting", vec!["安装完成，正在启动…".into()]);
                 boot_sequence(app);
@@ -862,20 +1446,25 @@ fn install_dsh(app: tauri::AppHandle) {
 /// the install worked.
 const NPM_INSTALL_FLAGS: [&str; 3] = ["--loglevel=http", "--no-audit", "--no-fund"];
 
-/// Run `npm i -g <DSH_PACKAGE>`, forwarding every output line to the page.
-fn run_install(app: &tauri::AppHandle) -> Result<(), String> {
+/// Run `npm i -g <spec>`, forwarding every output line to the page.
+///
+/// `spec` is either the bare package name (first install: follow the default tag)
+/// or `pkg@version` with a version the caller already resolved and showed the
+/// user. It is never a `pkg@tag`: a tag can move between the check and the
+/// install, and the panel just promised a specific number.
+fn run_install(app: &tauri::AppHandle, spec: &str) -> Result<(), String> {
     let mut cmd = if cfg!(windows) {
         // npm is a .cmd shim, so it needs a shell to run at all.
         let mut c = Command::new("cmd");
         c.args(["/C", "npm", "install", "-g"]);
         c.args(NPM_INSTALL_FLAGS);
-        c.arg(DSH_PACKAGE);
+        c.arg(spec);
         c
     } else {
         let mut c = Command::new("npm");
         c.args(["install", "-g"]);
         c.args(NPM_INSTALL_FLAGS);
-        c.arg(DSH_PACKAGE);
+        c.arg(spec);
         c
     };
     #[cfg(windows)]
@@ -909,7 +1498,7 @@ fn run_install(app: &tauri::AppHandle) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "npm install -g {DSH_PACKAGE} 失败（退出码 {}）。上面的日志里通常有原因，常见的是网络或权限问题。",
+            "npm install -g {spec} 失败（退出码 {}）。上面的日志里通常有原因，常见的是网络或权限问题。",
             status.code().map_or_else(|| "未知".to_string(), |c| c.to_string())
         ))
     }
@@ -969,6 +1558,428 @@ fn pump_lines<R: std::io::Read + Send + 'static>(
     })
 }
 
+/// Ask the installed dsh what version it is.
+fn installed_dsh_version() -> Option<String> {
+    let out = capture(&["dsh", "--version"])?;
+    parse_version(&out)
+}
+
+/// What a channel resolved to.
+enum ChannelLookup {
+    Version(String),
+    /// The package has no such dist-tag — nothing has been published there.
+    Missing,
+    /// The tag exists but its value is not a version we can read.
+    Failed,
+}
+
+/// Ask npm for the dsh package's dist-tags: every channel in one round trip.
+///
+/// Deliberately npm rather than an HTTP request to registry.npmjs.org: npm
+/// applies the user's own `.npmrc` — a mirror, a corporate proxy, auth — so a
+/// machine that can install dsh at all can also check it. Talking to the public
+/// registry directly would report "unreachable" on exactly those setups, and
+/// would add an HTTP stack to a binary that currently needs none.
+///
+/// `dist-tags` rather than a `version` per channel because the panel shows both
+/// channels at once: one spawn instead of one per channel, and it also tells a
+/// tag that does not exist apart from a lookup that failed.
+fn dsh_dist_tags() -> Option<serde_json::Map<String, serde_json::Value>> {
+    let out = capture(&["npm", "view", DSH_PACKAGE, "dist-tags", "--json"])?;
+    match serde_json::from_str::<serde_json::Value>(&out) {
+        Ok(serde_json::Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// Resolve one channel out of the dist-tags map.
+///
+/// The version is taken through `parse_version`, which both validates it and
+/// bounds it to `[0-9A-Za-z.+-]`. That is what makes it safe to interpolate into
+/// the `pkg@version` spec `run_install` puts on a command line.
+fn channel_dsh_version(
+    tags: &serde_json::Map<String, serde_json::Value>,
+    channel: &str,
+) -> ChannelLookup {
+    match tags.get(channel).and_then(|v| v.as_str()) {
+        Some(raw) => match parse_version(raw) {
+            Some(v) => ChannelLookup::Version(v),
+            None => ChannelLookup::Failed,
+        },
+        None => ChannelLookup::Missing,
+    }
+}
+
+/// Run a command and return its stdout, or None if it could not run or failed.
+///
+/// Goes through `cmd /C` on Windows because both commands we use it for are
+/// `.cmd` shims, which `CreateProcess` cannot execute directly. Output is
+/// decoded lossily: npm's can arrive in the console's OEM codepage, and a
+/// version number is ASCII either way.
+fn capture(argv: &[&str]) -> Option<String> {
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C");
+        c.args(argv);
+        c
+    } else {
+        let mut c = Command::new(argv[0]);
+        c.args(&argv[1..]);
+        c
+    };
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.stdin(Stdio::null()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Pull the first semver-looking token out of a command's output.
+///
+/// Lenient about what surrounds it because the two producers disagree: `npm view`
+/// prints a bare `1.2.3`, while a CLI's `--version` may print `dsh/1.2.3`, a
+/// banner line, or the version among other words. Anchored on a digit run that
+/// is not itself mid-number, so a token is matched whole rather than from its
+/// tail.
+fn parse_version(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for (i, c) in text.char_indices() {
+        if !c.is_ascii_digit() {
+            continue;
+        }
+        // Only consider the start of a run, so "1.2.3" is not also tried at "2".
+        if i > 0 && matches!(bytes[i - 1], b'0'..=b'9' | b'.') {
+            continue;
+        }
+        let rest = &text[i..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
+            .unwrap_or(rest.len());
+        // A trailing '.' belongs to the sentence, not the version.
+        let candidate = rest[..end].trim_end_matches('.');
+        // Require at least major.minor, so a lone "8" from unrelated prose (an
+        // exit code, a port) is not mistaken for a version.
+        if candidate
+            .split('.')
+            .take(2)
+            .filter(|p| !p.is_empty())
+            .count()
+            == 2
+            && candidate.starts_with(|c: char| c.is_ascii_digit())
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Order two versions by semver precedence.
+///
+/// Hand-rolled rather than pulling in the `semver` crate: this decides which way
+/// the update panel's button points, and the rules that matter here are short.
+/// Build metadata (`+...`) is ignored, as the spec requires; a prerelease sorts
+/// below the release it precedes — which is what puts `0.1.1-rc.2` below `0.1.1`
+/// and above `0.1.1-rc.1`.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // Build metadata never affects precedence.
+    let strip_build = |v: &str| v.split('+').next().unwrap_or(v).to_string();
+    let a = strip_build(a);
+    let b = strip_build(b);
+
+    let split = |v: &str| -> (Vec<u64>, String) {
+        let (core, pre) = v.split_once('-').unwrap_or((v, ""));
+        let nums = core
+            .split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect();
+        (nums, pre.to_string())
+    };
+    let (a_nums, a_pre) = split(&a);
+    let (b_nums, b_pre) = split(&b);
+
+    // Missing components are zero: 1.2 and 1.2.0 are the same release.
+    for i in 0..a_nums.len().max(b_nums.len()) {
+        let ord = a_nums
+            .get(i)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&b_nums.get(i).copied().unwrap_or(0));
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+
+    match (a_pre.is_empty(), b_pre.is_empty()) {
+        (true, true) => Ordering::Equal,
+        // A release outranks any prerelease of the same core version.
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => compare_prerelease(&a_pre, &b_pre),
+    }
+}
+
+/// Compare two prerelease strings dot-part by dot-part: numeric parts compare
+/// numerically, anything else lexically, and a numeric part sorts below a
+/// non-numeric one. A shorter prerelease sorts below an otherwise equal longer
+/// one (`1.0.0-rc` < `1.0.0-rc.1`).
+fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut a_parts = a.split('.');
+    let mut b_parts = b.split('.');
+    loop {
+        match (a_parts.next(), b_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+/// Move the installed dsh to whatever the selected channel points at, from the
+/// panel's action button. May be a downgrade — switching off alpha is the case
+/// this exists for.
+#[tauri::command]
+fn upgrade_dsh(app: tauri::AppHandle, channel: Option<String>) {
+    let channel = channel
+        .as_deref()
+        .map(normalize_channel)
+        .unwrap_or_else(|| dsh_channel(&app));
+    std::thread::spawn(move || upgrade_dsh_to(&app, channel));
+}
+
+/// Resolve the channel, then hand off to `upgrade_dsh_now`.
+///
+/// Resolved here rather than trusting a version the page sent: the panel's number
+/// may be minutes old, and this is what ends up on a command line.
+fn upgrade_dsh_to(app: &tauri::AppHandle, channel: &'static str) {
+    // Say we are working before doing any of it. The resolve below spawns
+    // `dsh --version` and a network-bound `npm view`, which together take
+    // seconds; until this existed the panel sat unchanged for all of them and the
+    // click read as having done nothing. Carries the numbers the panel is already
+    // showing rather than None, so the row does not blank out and refill.
+    let (installed, target) = cached_dsh_versions(app);
+    emit_dsh_version(
+        app,
+        "resolving",
+        channel,
+        installed.as_deref(),
+        target.as_deref(),
+        None,
+    );
+
+    match check_dsh_version(channel) {
+        VersionCheck::Compared {
+            installed,
+            target,
+            relation,
+            ..
+        } => {
+            report_dsh_version(
+                app,
+                &VersionCheck::Compared {
+                    installed: installed.clone(),
+                    channel,
+                    target: target.clone(),
+                    relation,
+                },
+            );
+            if relation == VersionRelation::Same {
+                return; // nothing to do; the panel's button is disabled anyway
+            }
+            upgrade_dsh_now(app, &installed, &target, relation);
+        }
+        other => {
+            // Nothing installable: say why on the error view rather than running
+            // an npm command that cannot do what the user asked.
+            let detail = match &other {
+                VersionCheck::ChannelEmpty { channel, .. } => {
+                    format!("{DSH_PACKAGE} 的 {channel} 通道还没有发布过版本，没有可安装的目标。")
+                }
+                VersionCheck::NotInstalled => "本机还没有安装 dsh。".to_string(),
+                VersionCheck::Failed { reason, .. } => reason.clone(),
+                VersionCheck::Compared { .. } => unreachable!(),
+            };
+            report_dsh_version(app, &other);
+            // The panel's own row now carries this, so only take over the content
+            // area when there is no GUI to take it over from. Killing a running
+            // session's iframe to announce that a version lookup failed is the
+            // wrong trade.
+            if !gui_is_up(app) {
+                emit_status(app, "error", vec![detail]);
+            }
+        }
+    }
+}
+
+/// The upgrade proper: stop our backend, reinstall the package, boot again.
+///
+/// Stopping first is not optional. `npm install -g` replaces the files the
+/// running `dsh web` is executing out of, and node has them open — on Windows
+/// that fails outright (EBUSY/EPERM), and on any platform a half-swapped package
+/// is a backend that no longer boots. So the sequence is: kill what we own,
+/// install, then let `boot_sequence` bring up the new version.
+fn upgrade_dsh_now(
+    app: &tauri::AppHandle,
+    installed: &str,
+    target: &str,
+    relation: VersionRelation,
+) {
+    // A backend we do not own (a `dsh web` already serving in a browser tab) is
+    // still holding the old files open, and we have no business killing somebody
+    // else's process. Refuse rather than corrupting their install.
+    let ours = backend_is_ours(app);
+    if !ours && probe_existing_web().is_some() {
+        emit_status(
+            app,
+            "error",
+            vec![format!(
+                "另一个 `dsh web` 正在运行（端口 {}），它占用着要被替换的文件。请先关掉它，再回来更新。",
+                probe_port()
+            )],
+        );
+        return;
+    }
+
+    let down = relation == VersionRelation::Older;
+    emit_status(
+        app,
+        "installing",
+        vec![
+            if down {
+                format!("正在把 dsh 回退到 {target}")
+            } else {
+                format!("正在把 dsh 更新到 {target}")
+            },
+            "装完会自动重新启动，稍等一下~".into(),
+        ],
+    );
+    // Our own backend has to let go of the files before npm touches them.
+    take_backend(app);
+    // The backend we just forced never released the ledger lock; the boot below
+    // would refuse to start otherwise.
+    clear_stale_task_board_lock();
+
+    // A downgrade is the one direction that can meet state it does not
+    // understand: `~/.dsh` holds versioned files (task-board/ledger-v2.json,
+    // storages/, settings.yaml) that the newer dsh may have migrated forward, and
+    // npm does not roll those back. Copy them aside first, and refuse the
+    // downgrade if that fails -- having promised a backup and then downgraded
+    // without one is worse than not downgrading.
+    if down {
+        match backup_dsh_home(app, installed) {
+            Ok(Some(path)) => {
+                let _ = app.emit(
+                    "dsh-install-log",
+                    format!("已备份 {} → {}", dsh_home().display(), path.display()),
+                );
+            }
+            // Nothing to back up: a machine that never ran dsh has no state.
+            Ok(None) => {}
+            Err(e) => {
+                emit_status(
+                    app,
+                    "error",
+                    vec![format!(
+                        "回退前备份 {} 失败，已中止：{e}\n手动备份后再试，或直接执行 npm i -g {DSH_PACKAGE}@{target}。",
+                        dsh_home().display()
+                    )],
+                );
+                return;
+            }
+        }
+    }
+
+    match run_install(app, &format!("{DSH_PACKAGE}@{target}")) {
+        Ok(()) => {
+            // Report the version we ended up on before booting, so the pill
+            // clears even if the boot then fails for an unrelated reason.
+            report_dsh_version(app, &check_dsh_version(dsh_channel(app)));
+            emit_status(
+                app,
+                "booting",
+                vec![if down {
+                    "回退完成，正在启动…".into()
+                } else {
+                    "更新完成，正在启动…".to_string()
+                }],
+            );
+            boot_sequence(app.clone());
+        }
+        // The retry button on the error view boots whatever version is installed,
+        // which is the right move whether the install landed or not.
+        Err(detail) => emit_status(app, "error", vec![detail]),
+    }
+}
+
+/// Copy `~/.dsh` aside before a downgrade. `Ok(None)` means there was nothing
+/// there. The destination carries the version being left behind, so several
+/// backups can coexist and each says what it came from.
+fn backup_dsh_home(app: &tauri::AppHandle, installed: &str) -> std::io::Result<Option<PathBuf>> {
+    let home = dsh_home();
+    if !home.is_dir() {
+        return Ok(None);
+    }
+    // Seconds since the epoch rather than a formatted date: unique and ordered,
+    // with no date-formatting dependency. `installed` is a version we parsed, so
+    // it cannot carry a path separator.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = home.with_file_name(format!(".dsh.bak-{installed}-{stamp}"));
+    let _ = app.emit(
+        "dsh-install-log",
+        format!("回退前先备份 {} …", home.display()),
+    );
+    copy_tree(&home, &dest)?;
+    Ok(Some(dest))
+}
+
+/// Recursively copy a directory. Hand-rolled to avoid a dependency for one call.
+///
+/// Symlinks are followed rather than recreated: `~/.dsh` is config and state, and
+/// a backup that points back at the files being replaced would not be a backup.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            // A lock file another process holds open is not worth failing the
+            // whole backup over -- it carries no state we could restore anyway.
+            match std::fs::copy(&src, &dst) {
+                Ok(_) => {}
+                Err(e) if src.extension().is_some_and(|x| x == "lock") => {
+                    eprintln!("skipping lock file {}: {e}", src.display());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Try booting again after a failure, from the page's retry button.
 #[tauri::command]
 fn retry_boot(app: tauri::AppHandle) {
@@ -1003,12 +2014,21 @@ fn open_node_site() {
     let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
-/// Tray icon (DeepSeek whale) with a menu: show window / quit.
-fn setup_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+/// Tray icon (DeepSeek whale) with a menu: show window / check for updates / quit.
+///
+/// Two separate update entries, because they update different things: the shell
+/// (this binary, via the Tauri updater) and dsh itself (the npm package that does
+/// the actual work). Conflating them would leave no way to update a months-old
+/// dsh under a current shell, which is the common case.
+///
+/// Not generic over the runtime: the menu handlers reach the commands, which take
+/// a concrete `AppHandle`. The generic only ever resolved to Wry anyway.
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示 DSH", true, None::<&str>)?;
-    let update = MenuItem::with_id(app, "update", "检查更新", true, None::<&str>)?;
+    let update = MenuItem::with_id(app, "update", "检查桌面端更新", true, None::<&str>)?;
+    let update_dsh = MenuItem::with_id(app, "update-dsh", "检查 dsh 更新", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &update, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &update, &update_dsh, &quit])?;
 
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
 
@@ -1028,6 +2048,12 @@ fn setup_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()>
             "update" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move { check_for_update(app).await });
+            }
+            "update-dsh" => {
+                // On a thread, not the async runtime: the check shells out twice
+                // and blocks, which would stall other tasks on that runtime.
+                let app = app.clone();
+                std::thread::spawn(move || check_dsh_update_interactive(&app));
             }
             "quit" => app.exit(0),
             _ => {}
@@ -1090,33 +2116,222 @@ fn confine_to_job(child: &Child) {
     }
 }
 
-/// Tray-triggered update check. Manual rather than automatic on startup: an
-/// update replaces the running binary and needs a relaunch, so it must not
-/// happen behind the user's back mid-session.
-async fn check_for_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+/// Updater manifest per channel.
+///
+/// `latest` is GitHub's own alias, which resolves to the newest release that is
+/// neither a draft nor a prerelease — so stable users never see an alpha. The
+/// alpha channel cannot use that alias for exactly that reason, so it gets a
+/// fixed prerelease tag whose `latest.json` CI overwrites on every prerelease
+/// (see `.github/workflows/release.yml`). Until the first one is published that
+/// URL 404s, which surfaces as `channel-empty` rather than an error.
+const SHELL_MANIFESTS: [(&str, &str); 2] = [
+    (
+        "latest",
+        "https://github.com/ColdSand803/dsh-desktop/releases/latest/download/latest.json",
+    ),
+    (
+        "alpha",
+        "https://github.com/ColdSand803/dsh-desktop/releases/download/alpha/latest.json",
+    ),
+];
+
+fn shell_manifest(channel: &str) -> Option<&'static str> {
+    SHELL_MANIFESTS
+        .iter()
+        .find(|(c, _)| *c == channel)
+        .map(|(_, url)| *url)
+}
+
+/// Look up what `channel` offers for this binary, without installing anything.
+///
+/// Returns the release's version alongside how it relates to the running one.
+/// The version comparator is deliberately "always yes": the default only accepts
+/// a strictly higher version, which would make a channel switch back to stable
+/// invisible. The direction is worked out afterwards with `relate`, so the panel
+/// can label the button 更新 or 回退.
+async fn resolve_shell_update(
+    app: &tauri::AppHandle,
+    channel: &'static str,
+) -> Result<Option<(tauri_plugin_updater::Update, VersionRelation)>, String> {
     use tauri_plugin_updater::UpdaterExt;
 
-    let result = match app.updater() {
-        Ok(updater) => updater.check().await,
-        Err(e) => {
-            let _ = app.dialog().message(format!("更新器初始化失败：{e}"));
+    let url = shell_manifest(channel).ok_or_else(|| format!("未知的通道 {channel}。"))?;
+    let endpoint = Url::parse(url).map_err(|e| format!("更新清单地址无效：{e}"))?;
+
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|e| format!("更新器初始化失败：{e}"))?
+        .version_comparator(|_current, _release| true)
+        .build()
+        .map_err(|e| format!("更新器初始化失败：{e}"))?;
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            let relation = relate(&update.version, &update.current_version);
+            Ok(Some((update, relation)))
+        }
+        // The comparator above always accepts, so `None` only happens on a 204.
+        Ok(None) => Ok(None),
+        // No manifest at that URL: the channel has published nothing yet. This is
+        // the alpha case before CI's first prerelease, and is not a failure.
+        Err(tauri_plugin_updater::Error::ReleaseNotFound) => Ok(None),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+/// Run a shell check for `channel` and report it to the page.
+#[tauri::command]
+async fn check_shell_update(app: tauri::AppHandle, channel: String) {
+    let channel = normalize_channel(&channel);
+    let installed = app.package_info().version.to_string();
+    emit_shell_version(&app, "checking", channel, Some(&installed), None, None);
+
+    match resolve_shell_update(&app, channel).await {
+        Ok(Some((update, relation))) => emit_shell_version(
+            &app,
+            relation.state(),
+            channel,
+            Some(&installed),
+            Some(&update.version),
+            None,
+        ),
+        Ok(None) => {
+            emit_shell_version(&app, "channel-empty", channel, Some(&installed), None, None)
+        }
+        Err(reason) => emit_shell_version(
+            &app,
+            "error",
+            channel,
+            Some(&installed),
+            None,
+            Some(&reason),
+        ),
+    }
+}
+
+/// Install what `channel` offers and restart into it.
+///
+/// Re-resolves rather than holding an `Update` from the earlier check: the object
+/// is not something to park across IPC calls, and one extra request is cheap next
+/// to replacing the running binary.
+#[tauri::command]
+async fn update_shell(app: tauri::AppHandle, channel: String) {
+    let channel = normalize_channel(&channel);
+    let installed = app.package_info().version.to_string();
+
+    // Fetching the manifest is a network round trip, so claim the row before it
+    // rather than after: same reason `upgrade_dsh_to` opens with this.
+    emit_shell_version(
+        &app,
+        "resolving",
+        channel,
+        Some(&installed),
+        cached_shell_target(&app).as_deref(),
+        None,
+    );
+
+    let resolved = match resolve_shell_update(&app, channel).await {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            emit_shell_version(&app, "channel-empty", channel, Some(&installed), None, None);
+            return;
+        }
+        Err(reason) => {
+            emit_shell_version(
+                &app,
+                "error",
+                channel,
+                Some(&installed),
+                None,
+                Some(&reason),
+            );
             return;
         }
     };
+    let (update, relation) = resolved;
+    if relation == VersionRelation::Same {
+        emit_shell_version(
+            &app,
+            "current",
+            channel,
+            Some(&installed),
+            Some(&update.version),
+            None,
+        );
+        return;
+    }
 
-    match result {
-        Ok(Some(update)) => {
+    let target = update.version.clone();
+    emit_shell_version(
+        &app,
+        "installing",
+        channel,
+        Some(&installed),
+        Some(&target),
+        None,
+    );
+    match update.download_and_install(|_, _| {}, || {}).await {
+        // Relaunch into the new binary; the RunEvent::Exit handler still runs,
+        // so the backend gets reaped.
+        Ok(()) => app.restart(),
+        Err(e) => emit_shell_version(
+            &app,
+            "error",
+            channel,
+            Some(&installed),
+            Some(&target),
+            Some(&format!("更新失败：{e}")),
+        ),
+    }
+}
+
+/// Tray-triggered shell update check, kept as the path that works when the
+/// webview does not: native dialogs need no page. The panel in the title bar is
+/// the richer entry point; this one follows the same selected channel so the two
+/// never disagree.
+///
+/// Manual rather than automatic on startup: an update replaces the running binary
+/// and needs a relaunch, so it must not happen behind the user's back mid-session.
+async fn check_for_update(app: tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+    const TITLE: &str = "DSH Desktop 更新";
+    let channel = shell_channel(&app);
+    let installed = app.package_info().version.to_string();
+    emit_shell_version(&app, "checking", channel, Some(&installed), None, None);
+
+    match resolve_shell_update(&app, channel).await {
+        Ok(Some((update, relation))) => {
+            emit_shell_version(
+                &app,
+                relation.state(),
+                channel,
+                Some(&installed),
+                Some(&update.version),
+                None,
+            );
+            if relation == VersionRelation::Same {
+                app.dialog()
+                    .message(format!("已经是最新版本（{installed}，{channel} 通道）。"))
+                    .title(TITLE)
+                    .show(|_| {});
+                return;
+            }
+            let down = relation == VersionRelation::Older;
             let version = update.version.clone();
             let handle = app.clone();
             app.dialog()
-                .message(format!(
-                    "发现新版本 {version}（当前 {}）。\n更新后应用会自动重启。",
-                    update.current_version
-                ))
-                .title("DSH Desktop 更新")
+                .message(if down {
+                    format!(
+                        "{channel} 通道当前是 {version}，比本机的 {installed} 旧。\n继续会回退到 {version}，之后应用自动重启。"
+                    )
+                } else {
+                    format!("发现新版本 {version}（当前 {installed}）。\n更新后应用会自动重启。")
+                })
+                .title(TITLE)
                 .buttons(MessageDialogButtons::OkCancelCustom(
-                    "立即更新".into(),
+                    if down { "回退".into() } else { "立即更新".into() },
                     "稍后".into(),
                 ))
                 .show(move |confirmed| {
@@ -1132,7 +2347,7 @@ async fn check_for_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
                                 let _ = handle
                                     .dialog()
                                     .message(format!("更新失败：{e}"))
-                                    .title("DSH Desktop 更新")
+                                    .title(TITLE)
                                     .blocking_show();
                             }
                         }
@@ -1140,15 +2355,109 @@ async fn check_for_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
                 });
         }
         Ok(None) => {
+            emit_shell_version(&app, "channel-empty", channel, Some(&installed), None, None);
             app.dialog()
-                .message("已经是最新版本。")
-                .title("DSH Desktop 更新")
+                .message(format!(
+                    "{channel} 通道还没有发布过版本，没有可安装的目标。本机是 {installed}。"
+                ))
+                .title(TITLE)
                 .show(|_| {});
         }
-        Err(e) => {
+        Err(reason) => {
+            emit_shell_version(
+                &app,
+                "error",
+                channel,
+                Some(&installed),
+                None,
+                Some(&reason),
+            );
             app.dialog()
-                .message(format!("检查更新失败：{e}"))
-                .title("DSH Desktop 更新")
+                .message(format!("检查更新失败：{reason}"))
+                .title(TITLE)
+                .show(|_| {});
+        }
+    }
+}
+
+/// Tray-triggered dsh version check, the counterpart to `check_for_update`.
+/// Unlike the startup check this always says something — the user asked, so
+/// "already current" and "could not tell" are both answers worth a dialog.
+fn check_dsh_update_interactive(app: &tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+    const TITLE: &str = "dsh 更新";
+
+    let channel = dsh_channel(app);
+    emit_dsh_version(app, "checking", channel, None, None, None);
+    let result = check_dsh_version(channel);
+    report_dsh_version(app, &result);
+
+    match result {
+        VersionCheck::Compared {
+            installed,
+            target,
+            relation,
+            ..
+        } => {
+            if relation == VersionRelation::Same {
+                app.dialog()
+                    .message(format!(
+                        "dsh 已经是 {channel} 通道的最新版本（{installed}）。"
+                    ))
+                    .title(TITLE)
+                    .show(|_| {});
+                return;
+            }
+            let down = relation == VersionRelation::Older;
+            let handle = app.clone();
+            app.dialog()
+                .message(if down {
+                    format!(
+                        "{channel} 通道当前是 dsh {target}，比本机的 {installed} 旧。\n继续会回退到 {target}；回退前会先把 ~/.dsh 备份一份，但里面的状态不会被迁移回旧格式。"
+                    )
+                } else {
+                    format!(
+                        "发现新版本 dsh {target}（当前 {installed}）。\n更新期间后端会短暂停止，完成后自动重新启动。"
+                    )
+                })
+                .title(TITLE)
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    if down { "回退".into() } else { "立即更新".into() },
+                    "稍后".into(),
+                ))
+                .show(move |confirmed| {
+                    if !confirmed {
+                        return;
+                    }
+                    // Bring the window up: the upgrade takes over the content area
+                    // to stream npm's log, which is no use behind the tray.
+                    if let Some(w) = handle.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
+                    }
+                    std::thread::spawn(move || upgrade_dsh_to(&handle, channel));
+                });
+        }
+        VersionCheck::ChannelEmpty { installed, .. } => {
+            app.dialog()
+                .message(format!(
+                    "{DSH_PACKAGE} 的 {channel} 通道还没有发布过版本。本机是 {installed}。"
+                ))
+                .title(TITLE)
+                .show(|_| {});
+        }
+        VersionCheck::NotInstalled => {
+            app.dialog()
+                .message("本机还没有安装 dsh，没有可比较的版本。")
+                .title(TITLE)
+                .show(|_| {});
+        }
+        VersionCheck::Failed { reason, .. } => {
+            app.dialog()
+                .message(format!("检查 dsh 更新失败：{reason}"))
+                .title(TITLE)
                 .show(|_| {});
         }
     }
@@ -1377,7 +2686,18 @@ fn backend_error_summary(log: &std::path::Path) -> Vec<String> {
             continue;
         }
         let text = text.trim_start_matches("[cause]: ").to_string();
-        let bucket = if text.contains("Cannot find") || text.contains("already owned by") {
+        // `does not provide an export named` is the missing-export shape, and it is
+        // the most useful line dsh emits: it names both the plugin that failed to
+        // import and the export it wanted. It earned its place here the hard way --
+        // twice a prerelease dropped an API that installed plugins still import,
+        // and both times this summary led with "plugin tree failed to load" while
+        // the line that explained it sat further down, so the log had to be read by
+        // hand. ESM resolves exports at load time, so one such plugin takes the
+        // whole tree with it and the wrapper lines are all identical.
+        let bucket = if text.contains("Cannot find")
+            || text.contains("already owned by")
+            || text.contains("does not provide an export named")
+        {
             &mut specific
         } else {
             &mut generic
@@ -1386,8 +2706,26 @@ fn backend_error_summary(log: &std::path::Path) -> Vec<String> {
             bucket.push(text);
         }
     }
+    // Checked before the buckets merge, so a log full of generic wrappers cannot
+    // push the evidence for this out of view.
+    let missing_export = specific
+        .iter()
+        .any(|l| l.contains("does not provide an export named"));
+
     specific.append(&mut generic);
     specific.truncate(4);
+
+    // The line above names the plugin and the export, which still leaves the reader
+    // to work out that this is a version disagreement rather than a broken file --
+    // and the two look identical from the outside. Say which it is, and what
+    // actually clears it. Added after the truncation so it cannot be cut.
+    if missing_export {
+        specific.push(
+            "这是 dsh 内核与已装插件的接口不一致（常见于装了预发布版本），插件文件本身没坏。\
+             可在标题栏「检查更新」里把 dsh 换回 latest 通道的版本，或更新/卸载报错的那个插件。"
+                .into(),
+        );
+    }
     specific
 }
 
@@ -1534,6 +2872,107 @@ fn strip_ansi(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Write `body` to a uniquely named file under the temp dir and hand back the
+    /// path. No tempfile dependency for one test; the caller removes it.
+    fn temp_log(name: &str, body: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("dsh-desktop-test-{name}-{stamp}.log"));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn leads_with_the_missing_export_not_the_wrapper() {
+        // The real shape of a boot failure after a prerelease dropped an API that
+        // installed plugins still import. Everything above the last [cause] is the
+        // same text for any plugin-tree failure, so the summary has to reach past it.
+        let log = temp_log(
+            "missing-export",
+            "[err] throw new Error(`${binName}: ${stage}: ${detail}${stack}`, { cause });\n\
+             [err] Error: dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include): loader entries failed to apply\n\
+             [err]     at loadAll (file:///C:/x/dist/loader.js:12:9)\n\
+             [err] [cause]: AggregateError: loader entries failed to apply\n\
+             [err]     at applyEntries (file:///C:/x/dist/loader.js:44:11)\n\
+             [err] [cause]: Error: failed to import loader entry web-ui-settings (@linxin666/dsh-client-ui-web-ui-settings): The requested module '@deepseek-ai/dsh-settings' does not provide an export named 'settingsNamespace'\n",
+        );
+        let summary = backend_error_summary(&log);
+        let _ = std::fs::remove_file(&log);
+
+        assert!(
+            summary[0].contains("does not provide an export named"),
+            "the line naming the plugin and the export has to come first, got {summary:#?}"
+        );
+        assert!(
+            summary[0].contains("@linxin666/dsh-client-ui-web-ui-settings"),
+            "and it has to still name the plugin: {:?}",
+            summary[0]
+        );
+        // Stack frames are noise; the wrapper lines are kept but demoted.
+        assert!(
+            !summary.iter().any(|l| l.trim_start().starts_with("at ")),
+            "no stack frames: {summary:#?}"
+        );
+        // The diagnosis is not readable off the raw line, so it is appended.
+        assert!(
+            summary.last().unwrap().contains("接口不一致"),
+            "expected the version-mismatch hint last, got {summary:#?}"
+        );
+    }
+
+    #[test]
+    fn adds_no_hint_when_nothing_is_missing_an_export() {
+        let log = temp_log(
+            "ledger-lock",
+            "[err] Error: dsh: task board is already owned by pid 4242\n",
+        );
+        let summary = backend_error_summary(&log);
+        let _ = std::fs::remove_file(&log);
+
+        assert_eq!(
+            summary.len(),
+            1,
+            "no hint for an unrelated failure: {summary:#?}"
+        );
+        assert!(summary[0].contains("already owned by"));
+    }
+
+    #[test]
+    fn reads_the_empty_line_as_the_backend_exiting() {
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(String::new()).unwrap();
+        assert!(wait_for_backend_exit(&rx));
+    }
+
+    #[test]
+    fn keeps_waiting_through_a_second_url() {
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send("http://127.0.0.1:52341".into()).unwrap();
+        tx.send("http://127.0.0.1:52341".into()).unwrap();
+        tx.send(String::new()).unwrap();
+        assert!(wait_for_backend_exit(&rx));
+    }
+
+    #[test]
+    fn reports_no_exit_when_the_sender_just_disappears() {
+        let (tx, rx) = mpsc::channel::<String>();
+        drop(tx);
+        assert!(!wait_for_backend_exit(&rx));
+    }
+
+    #[test]
+    fn retiring_a_backend_moves_the_generation_on() {
+        // What the watcher actually compares. The empty-slot case matters too:
+        // `take_backend` returns None there but must still invalidate any
+        // watcher left over from a backend we no longer track.
+        let state = Backend::default();
+        let mine = state.generation.load(Ordering::SeqCst);
+        assert_eq!(state.generation.fetch_add(1, Ordering::SeqCst), mine);
+        assert_ne!(state.generation.load(Ordering::SeqCst), mine);
+    }
+
     #[test]
     fn accepts_loopback_with_port() {
         assert_eq!(
@@ -1612,6 +3051,167 @@ mod tests {
         assert!(parse_title_marker("[dsh:0f111:e2e8f0]x").is_none()); // short hex
         assert!(parse_title_marker("[dsh:zzzzzz:e2e8f0]x").is_none()); // not hex
         assert!(parse_title_marker("[dsh:0f1115:e2e8f0").is_none()); // unterminated
+    }
+
+    #[test]
+    fn parses_a_bare_version() {
+        // What `npm view <pkg> version` prints.
+        assert_eq!(parse_version("1.2.3\n").as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn parses_a_version_out_of_surrounding_text() {
+        // A CLI's --version is not obliged to print only the number.
+        assert_eq!(
+            parse_version("dsh/2.0.1 win32-x64").as_deref(),
+            Some("2.0.1")
+        );
+        assert_eq!(
+            parse_version("dsh version 0.9.12").as_deref(),
+            Some("0.9.12")
+        );
+        // The whole token is taken, not its tail: anchoring on a digit run start
+        // is what stops "1.2.3" from also matching at the "2".
+        assert_eq!(parse_version("v1.2.3").as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn keeps_prerelease_and_drops_trailing_prose() {
+        assert_eq!(parse_version("3.0.0-rc.2").as_deref(), Some("3.0.0-rc.2"));
+        assert_eq!(parse_version("installed 1.4.0.").as_deref(), Some("1.4.0"));
+    }
+
+    #[test]
+    fn ignores_output_with_no_version() {
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("command not found"), None);
+        // A lone integer is an exit code or a port, not a version.
+        assert_eq!(parse_version("exited with 8"), None);
+    }
+
+    /// The old `is_newer`, kept as a test helper so these cases stay readable.
+    fn is_newer(a: &str, b: &str) -> bool {
+        relate(a, b) == VersionRelation::Newer
+    }
+
+    #[test]
+    fn orders_releases_by_component() {
+        assert!(is_newer("1.2.4", "1.2.3"));
+        assert!(is_newer("1.3.0", "1.2.99"));
+        assert!(is_newer("2.0.0", "1.99.99"));
+        assert!(!is_newer("1.2.3", "1.2.3"));
+        assert!(!is_newer("1.2.3", "1.2.4"));
+        // Numeric, not lexical: "10" beats "9".
+        assert!(is_newer("1.10.0", "1.9.0"));
+    }
+
+    #[test]
+    fn treats_missing_components_as_zero() {
+        assert!(!is_newer("1.2", "1.2.0"));
+        assert!(!is_newer("1.2.0", "1.2"));
+        assert!(is_newer("1.3", "1.2.9"));
+    }
+
+    #[test]
+    fn ranks_a_release_above_its_prereleases() {
+        assert!(is_newer("1.0.0", "1.0.0-rc.1"));
+        assert!(!is_newer("1.0.0-rc.1", "1.0.0"));
+        assert!(is_newer("1.0.0-rc.2", "1.0.0-rc.1"));
+        // Numeric identifiers compare numerically, and sort below alphanumeric.
+        assert!(is_newer("1.0.0-rc.10", "1.0.0-rc.2"));
+        assert!(is_newer("1.0.0-alpha.beta", "1.0.0-alpha.1"));
+        // A longer prerelease outranks the prefix it extends.
+        assert!(is_newer("1.0.0-rc.1", "1.0.0-rc"));
+    }
+
+    #[test]
+    fn ignores_build_metadata() {
+        // Per semver, build metadata carries no precedence.
+        assert!(!is_newer("1.2.3+build.9", "1.2.3+build.1"));
+        assert!(is_newer("1.2.4+a", "1.2.3+z"));
+    }
+
+    #[test]
+    fn relates_a_channel_target_in_both_directions() {
+        // The real data this was built against: the alpha tag is ahead of latest,
+        // so switching to alpha is an update and switching back is a rollback.
+        assert_eq!(
+            relate("0.1.2-alpha.3", "0.1.1-rc.2"),
+            VersionRelation::Newer
+        );
+        assert_eq!(
+            relate("0.1.1-rc.2", "0.1.2-alpha.3"),
+            VersionRelation::Older
+        );
+        assert_eq!(relate("0.1.1-rc.2", "0.1.1-rc.2"), VersionRelation::Same);
+    }
+
+    #[test]
+    fn maps_a_relation_to_the_pages_state() {
+        // Only `outdated` raises the title bar pill; a rollback must not nag.
+        assert_eq!(VersionRelation::Newer.state(), "outdated");
+        assert_eq!(VersionRelation::Older.state(), "rollback");
+        assert_eq!(VersionRelation::Same.state(), "current");
+    }
+
+    #[test]
+    fn normalizes_known_channels_and_rejects_everything_else() {
+        assert_eq!(normalize_channel("latest"), "latest");
+        assert_eq!(normalize_channel("alpha"), "alpha");
+        assert_eq!(normalize_channel(" alpha "), "alpha");
+        assert_eq!(normalize_channel("ALPHA"), "alpha");
+        // Anything off the allowlist falls back rather than reaching a command
+        // line: this value is interpolated into `npm view`.
+        assert_eq!(normalize_channel("next"), DEFAULT_CHANNEL);
+        assert_eq!(normalize_channel(""), DEFAULT_CHANNEL);
+        assert_eq!(normalize_channel("latest; rm -rf /"), DEFAULT_CHANNEL);
+        assert_eq!(normalize_channel("../../etc"), DEFAULT_CHANNEL);
+    }
+
+    #[test]
+    fn resolves_a_channel_out_of_dist_tags() {
+        // Shaped like the real `npm view @deepseek-ai/dsh dist-tags --json`.
+        let tags = match serde_json::json!({
+            "latest": "0.1.1-rc.2",
+            "next": "0.1.1-rc.2",
+            "alpha": "0.1.2-alpha.3",
+            "broken": "not-a-version",
+        }) {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+
+        assert!(matches!(
+            channel_dsh_version(&tags, "alpha"),
+            ChannelLookup::Version(v) if v == "0.1.2-alpha.3"
+        ));
+        assert!(matches!(
+            channel_dsh_version(&tags, "latest"),
+            ChannelLookup::Version(v) if v == "0.1.1-rc.2"
+        ));
+        // A tag the package does not publish is "nothing here", not a failure --
+        // the panel says so instead of showing an error.
+        assert!(matches!(
+            channel_dsh_version(&tags, "beta"),
+            ChannelLookup::Missing
+        ));
+        assert!(matches!(
+            channel_dsh_version(&tags, "broken"),
+            ChannelLookup::Failed
+        ));
+    }
+
+    #[test]
+    fn has_a_manifest_for_every_channel() {
+        // A channel with no manifest could never be checked, and the panel offers
+        // exactly the channels in CHANNELS.
+        for channel in CHANNELS {
+            assert!(
+                shell_manifest(channel).is_some(),
+                "no updater manifest for channel {channel}"
+            );
+        }
+        assert!(shell_manifest("beta").is_none());
     }
 
     #[test]
