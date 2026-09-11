@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the bundled shell page: event listening (dsh-status, dsh-install-log), the IPC it needs to report status and trigger the install, and the window controls the self-drawn title bar depends on — the window is created with decorations(false), so dragging, minimize, maximize and close have no native affordance and must come from the page.",
-  "windows": ["main"],
+  "description": "Default capability for the bundled shell page: event listening (dsh-status, dsh-install-log), the IPC it needs to report status and trigger the install, and the window controls the self-drawn title bar depends on — the window is created with decorations(false), so dragging, minimize, maximize and close have no native affordance and must come from the page. Scoped to the `main` webview, not the whole window: the dsh GUI is a sibling child webview in that same window (see mount_gui), and it renders model output, so it must not be handed window control. Capabilities without a `remote` block do not apply to remote origins, so the dsh page could not reach these anyway — the webview scope makes that structural rather than incidental.",
+  "webviews": ["main"],
   "permissions": [
     "core:default",
     "core:event:default",

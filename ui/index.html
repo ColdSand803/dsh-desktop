@@ -152,8 +152,11 @@
       }
 
       /* ---------- content area ----------
-         Centres whichever boot view is active, or is filled edge-to-edge by
-         the GUI iframe once the backend is up. */
+         Centres whichever boot view is active. The dsh GUI is not in this
+         document: it is a sibling webview the host positions over exactly this
+         area (see TITLEBAR_H and gui_bounds in src-tauri/src/main.rs), because
+         dsh's session cookie is SameSite=Strict and so never reaches a frame.
+         When the GUI is up, this area is simply covered. */
       .content {
         flex: 1;
         min-height: 0;
@@ -161,16 +164,6 @@
         align-items: center;
         justify-content: center;
         position: relative;
-      }
-      /* The dsh GUI. Hidden until the backend URL arrives. */
-      #gui {
-        position: absolute;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        border: 0;
-        display: none;
-        background: #1b1b1c;
       }
       #views {
         width: 100%;
@@ -368,9 +361,10 @@
 
       /* ---------- update confirmation ----------
          An overlay rather than one of the boot views: the GUI is usually running
-         when the pill gets clicked, and switching views would tear the iframe
-         down for a prompt the user may well dismiss. This floats over whatever
-         is there and leaves it untouched. */
+         when the pill gets clicked, and reporting a boot state would take it off
+         screen for a prompt the user may well dismiss. This floats over whatever
+         is there and leaves the dsh session alone. The host still has to lift the
+         dsh webview out of the way while it is open -- see setPanelOpen. */
       #update-modal {
         display: none;
         position: absolute;
@@ -677,8 +671,6 @@
     </div>
 
     <div class="content">
-      <iframe id="gui" title="DeepSeek Harness"></iframe>
-
       <div id="views">
         <div class="view active" id="view-booting">
           <div class="logo pulse">
@@ -851,7 +843,6 @@
       const tauri = window.__TAURI__;
       const invoke = tauri && tauri.core ? tauri.core.invoke : null;
 
-      const gui = document.getElementById("gui");
       const viewsBox = document.getElementById("views");
       const views = {};
       for (const el of document.querySelectorAll(".view")) {
@@ -866,7 +857,7 @@
       const checkButton = document.getElementById("btn-check");
       const modal = document.getElementById("update-modal");
 
-      // Whether the GUI iframe is currently serving, i.e. whether there is a dsh
+      // Whether the dsh GUI is currently serving, i.e. whether there is a dsh
       // session on screen that an update would interrupt, and whether that backend
       // is one this app started. Both come from every status the host pushes, so
       // they cannot drift from what the window shows.
@@ -953,23 +944,9 @@
           if (bg) bar.style.backgroundColor = bg;
           if (fg) bar.style.color = fg;
           // Match the window edges too, so resizing does not flash the old
-          // colour at the margins.
-          if (bg) {
-            document.body.style.backgroundColor = bg;
-            gui.style.backgroundColor = bg;
-          }
-        } catch (e) {}
-      };
-
-      // Hand the backend URL to the iframe. The window itself is never
-      // navigated — it has to stay on this page for the title bar to survive.
-      window.__dshSetFrame = function (url) {
-        try {
-          if (!url || gui.dataset.src === url) return; // idempotent: host retries
-          gui.dataset.src = url;
-          gui.src = url;
-          gui.style.display = "block";
-          viewsBox.classList.add("hidden");
+          // colour at the margins. The dsh webview covers the content area while
+          // the GUI is up, but a resize can briefly expose what is behind it.
+          if (bg) document.body.style.backgroundColor = bg;
         } catch (e) {}
       };
 
@@ -990,21 +967,18 @@
         pill.disabled = state === "installing";
         checkButton.disabled = state === "installing";
 
-        // `ready` is not a view: the GUI is up, so the iframe owns the content
-        // area. Sent so a page that reloads after the handoff can restore it
-        // instead of sitting on the splash forever.
+        // `ready` is not a view: the dsh webview is a sibling of this one and the
+        // host has it covering the whole content area, so all this page can
+        // usefully do is get out from under it. Hiding rather than leaving a
+        // splash underneath matters on resize, when a frame or two of whatever is
+        // behind the webview can show at the edges.
+        //
+        // Navigation is the host's job (see show_gui): the URL carries dsh's
+        // launch token, and this document must never see it.
         if (state === "ready") {
-          const url = Array.isArray(detail) ? detail[0] : null;
-          if (url) window.__dshSetFrame(url);
+          viewsBox.classList.add("hidden");
           return;
         }
-        // Any other state means we are not serving a GUI right now. Drop the
-        // remembered src as well as hiding: __dshSetFrame ignores a URL it is
-        // already showing, so a retry that comes back on the same port would
-        // otherwise be treated as a no-op and leave the iframe hidden.
-        gui.style.display = "none";
-        gui.removeAttribute("src");
-        delete gui.dataset.src;
         viewsBox.classList.remove("hidden");
 
         const view = views[state] || views.booting;
@@ -1289,8 +1263,19 @@
         }
       }
 
+      // The panel lives in this document, and this document is painted *under* the
+      // dsh webview — there is no z-index across webviews. So opening the panel
+      // has to ask the host to take the GUI off screen, or the card would be drawn
+      // somewhere nobody can see. Closing puts it back (the host ignores that if
+      // the GUI is no longer what should be showing).
+      function setPanelOpen(open) {
+        if (!invoke) return;
+        invoke("set_panel_open", { open }).catch(() => {});
+      }
+
       function openModal() {
         modal.classList.add("visible");
+        setPanelOpen(true);
         // Always re-check on open: the cached report may be from startup, and
         // "check for updates" that shows a stale answer is not a check.
         checkAll();
@@ -1298,6 +1283,7 @@
 
       function closeModal() {
         modal.classList.remove("visible");
+        setPanelOpen(false);
         // Leaving the panel cancels a pending confirmation: coming back to a
         // button already asking "confirm?" would be a click the user does not
         // remember arming.

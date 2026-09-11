@@ -10,8 +10,11 @@ DeepSeek Harness (dsh) 的桌面客户端。用 [Tauri v2](https://tauri.app) �
   换主题（包括第三方主题）会跟着变，**Win10 / Win11 表现一致**
 - **无黑窗口**：spawn 后端与清理进程时都带 `CREATE_NO_WINDOW`，全程无命令行窗口闪现
 - **托盘常驻**：系统托盘显示鲸鱼图标，左键单击唤出窗口；关闭窗口 = 最小化到托盘（后端继续运行）；托盘菜单「退出」彻底退出并清理后端
-- 启动时先探测 3080 上是否已有 dsh web：有就复用，没有才自己拉起 `dsh web --port 0`（系统分配空闲端口），
-  解析后端输出，把实际地址交给外壳页的 iframe（窗口本身不导航，见下）
+- 启动时拉起 `dsh web --port 0`（系统分配空闲端口），解析后端输出拿到实际地址，
+  交给一个**独立的子 webview** 承载(窗口本身不导航，见下)
+- **后端报错时说人话**：GUI 铺满整个窗口、自己没有任何边框，所以 `dsh web` 返回的纯文本错误
+  原本就**是**整个界面 —— 白底左上角一行英文。检测到这种情况会换上外壳自己的错误页，
+  带上后端原话和「重试」按钮
 - **没装 dsh 也能用**：启动前先探测环境，缺 `dsh` 时窗口停在引导页，可一键 `npm i -g @deepseek-ai/dsh`（日志实时显示），装完自动接着启动；连 npm 都没有则引导去装 Node.js
 - 退出时结束整个后端进程树（含 cloudflared 等辅助进程）。Windows 上只能强杀，原因和实测见
   `main.rs` 里 `kill_process_tree` 的注释
@@ -70,23 +73,31 @@ cargo fmt --check
   npm run dev
   ```
 
-- **端口**：启动时先探测 `3080`（探测端口，可用 `DSH_DESKTOP_PROBE_PORT` 覆盖）。
+- **端口**：总是自己拉起 `dsh web --port 0`，让系统挑空闲端口。
 
-  - 探到已有 dsh web 在跑（比如浏览器那个实例），就**直接复用**它，不再起自己的后端。
-    这样可以避开 task-board 的单实例锁互相冲突。这种情况下退出桌面端**不会**杀掉那个后端——它不归我们管。
-  - 没探到，才自己拉起 `dsh web --port 0` 让系统挑空闲端口。
+  **不再复用已有后端。** dsh `0.1.5` 起，后端用一个每次启动新生成的 token 认证浏览器,
+  那个 token 只印在**它自己**的 stdout 上，我们没看见过，也就没法向别人的后端认证。
+  同一个工作区里已经有 dsh 在跑的情况，改成读 task-board 的账本锁来发现并报错 ——
+  这个信号比端口探测更准：它不挑端口，而且它才是真正会撞的东西。
 
-- **标题栏 / 外壳结构**：窗口以 `decorations: false` 创建，整个生命周期都停在外壳页
-  `ui/index.html` 上、**从不导航**；标题栏由外壳自己画，dsh 的 GUI 装在外壳的 iframe 里。
-  这样标题栏才能是任意颜色——原生标题栏的染色属性需要 Windows 11。详细原理见 `main.rs`
-  里 `THEME_WATCH_JS` 和窗口创建处的注释。
+- **标题栏 / 外壳结构**：窗口以 `decorations: false` 创建，外壳 webview 整个生命周期都停在
+  `ui/index.html` 上、**从不导航**，标题栏由它自己画。这样标题栏才能是任意颜色——原生标题栏
+  的染色属性需要 Windows 11。
+
+  dsh 的 GUI 是同一个窗口里的**第二个平级 webview**，位置贴在标题栏下方，开更新面板时会被挪走。
+
+  必须是平级 webview 而不是 iframe：dsh `0.1.5` 起用 `SameSite=Strict` 的 cookie 认证浏览器，
+  而这种 cookie 浏览器**永远不会**从跨站 iframe 里发出去 —— 于是原来的 iframe 方案每个请求都吃
+  `401 dsh web authentication required`。子 webview 是自己的顶层浏览上下文，cookie 就是第一方的。
+  详细原理见 `main.rs` 里 `THEME_WATCH_JS`、`show_gui` 和窗口创建处的注释。
 
 - **关窗与退出**：点窗口关闭按钮会把窗口隐藏到托盘（后端继续服务），这是桌面常驻应用的常规行为。
   要真正结束，请用托盘右键菜单的「退出」，或在托盘图标上左键唤回窗口。若希望「关窗即完全退出」，
   把 `main.rs` 中 `RunEvent::WindowEvent ... CloseRequested` 分支删掉即可恢复默认行为。
 
 - **后端生命周期**：后端随应用启动、随应用退出。如果后端自己崩了，应用**不会**跟着消失——
-  会收起 iframe、显示错误页和「重试」按钮。
+  会藏起 dsh 那个 webview、显示错误页和「重试」按钮。后端还活着但返回的不是界面（比如认证失败
+  的纯文本 401）也走同一条路：检测到就换上错误页，把后端原话一起显示出来。
 
 - **没装 dsh 时的引导**：启动前会先探测 `dsh` 是否在 PATH 中，结果分三种——
 
@@ -113,7 +124,7 @@ dsh-desktop/
 ├── .github/workflows/
 │   ├── ci.yml           # windows-latest 上跑 fmt / clippy / test
 │   └── release.yml      # 打 tag 时构建、签名、建 draft release
-├── ui/                  # 外壳页：自绘标题栏 + GUI iframe + 引导状态机
+├── ui/                  # 外壳页：自绘标题栏 + 更新面板 + 引导状态机
 │                        #   （启动中、缺 dsh、安装中、缺 Node、出错、ready）
 ├── scripts/
 │   └── gen-icons.js     # 从 DSH favicon.svg 渲染 DeepSeek 鲸鱼图标（应用 + 托盘）
@@ -151,9 +162,13 @@ dsh-desktop/
   dsh 回退前会把 `~/.dsh` 复制到 `~/.dsh.bak-<版本>-<时间戳>`，备份失败就中止。但**里面的状态
   不会被迁移回旧格式**（`task-board/ledger-v2.json`、`storages/`、`settings.yaml` 都带版本），
   新版本写过的文件旧版本可能读不了。
-- **GUI 跑在 iframe 里**，这是自绘标题栏的代价。目前可用：dsh 没有设 `X-Frame-Options`
-  或 CSP `frame-ancestors`，前端也没有 frame-busting。但这不是它承诺的接口——哪天 dsh 加上
-  这类头，GUI 区域就会白屏。
+- **GUI 是个平级子 webview，代价是没有层级关系。** 多个 webview 之间没有 z-index 概念，
+  谁后创建谁在上面，外壳画的东西一律在 dsh 底下。所以更新面板打开时只能先把 dsh 那个 webview
+  整个藏起来，关闭时再放回来 —— 不是叠在上面。
+- **子 webview 的尺寸要自己维护。** Tauri 的 `auto_resize` 会把它撑满整个窗口、吃掉标题栏那 32px，
+  所以窗口尺寸和 DPI 变化时是由 `main.rs` 里的 `GuiCmd::Fit` 手动重算位置的。
+  另外注意 `get_webview_window("main")` 在子 webview 创建之后会**永久返回 `None`**（它要求窗口
+  只有一个同名 webview），必须走 `get_window` / `get_webview` —— 见 `main_window` 的注释。
 - `DWMWA_CAPTION_COLOR` / `TEXT_COLOR` / `BORDER_COLOR` 仍然要 Windows 11（build 22000+），
   Win10 上无害失败。但这**不影响标题栏颜色**——标题栏是自绘的，不经过 DWM；这几个属性现在只用来
   染窗口边框，以及设 `USE_IMMERSIVE_DARK_MODE`。

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "remote-theme",
-  "description": "Lets the locally-served dsh GUI report its light/dark theme to the host so the native title bar can follow it. Deliberately emit-only: the dsh page renders model output, so it must not inherit the `default` capability's core:default grant (window control, path, app APIs). Capabilities without a `remote` block do not apply to remote origins, so this is the only surface the backend origin gets.",
-  "windows": ["main"],
+  "description": "Lets the locally-served dsh GUI report two things to the host: its light/dark theme, so the self-drawn title bar can follow it (dsh-theme), and that it loaded something other than the GUI, so the shell can show a real error instead of leaving dsh's raw 401 text as the whole window (dsh-gui-fault). Deliberately emit-only: the dsh page renders model output, so it must not inherit the `default` capability's core:default grant (window control, path, app APIs). Scoped to the `dsh-gui` webview, the only one ever navigated to the backend origin. Capabilities without a `remote` block do not apply to remote origins, so this is the whole surface the backend origin gets — Tauri also rejects app-defined commands from a remote origin unless a capability names them, and none does.",
+  "webviews": ["dsh-gui"],
   "remote": {
     "urls": ["http://127.0.0.1:*", "http://localhost:*"]
   },

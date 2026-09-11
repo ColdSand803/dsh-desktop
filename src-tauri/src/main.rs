@@ -3,7 +3,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,8 +12,11 @@ use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::webview::WebviewWindowBuilder;
-use tauri::{Emitter, Listener, Manager, RunEvent, Url, WebviewUrl, WindowEvent};
+use tauri::webview::{WebviewBuilder, WebviewWindowBuilder};
+use tauri::{
+    Emitter, Listener, Manager, PhysicalPosition, PhysicalSize, RunEvent, Url, WebviewUrl,
+    WindowEvent,
+};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -155,6 +157,11 @@ impl Default for Channels {
 /// How long we wait for `dsh web` to print its URL before calling it a failure.
 const BACKEND_READY_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long a backend we just killed may go on holding the task-board ledger lock
+/// before we treat the owner as somebody else's dsh. `taskkill /T /F` returns
+/// before the tree is reaped, so a moment of overlap is normal.
+const LOCK_RELEASE_GRACE: Duration = Duration::from_millis(1200);
+
 /// Colours sampled from the dsh page, as reported by THEME_WATCH_JS.
 #[derive(Clone, Copy, serde::Deserialize)]
 struct Theme {
@@ -193,16 +200,26 @@ impl Theme {
 
 /// Push a sampled theme to the self-drawn title bar, and tint the native frame
 /// where the OS supports it.
-fn apply_theme(window: &tauri::WebviewWindow, theme: Theme) {
+///
+/// Takes the handle rather than a window so it can be called from anywhere;
+/// both halves go through `main_window`/`get_webview`, never
+/// `get_webview_window` — see `main_window` for why.
+fn apply_theme(app: &tauri::AppHandle, theme: Theme) {
     let js = format!(
         "window.__dshApplyTheme && window.__dshApplyTheme({}, {})",
         serde_json::to_string(&theme.css_bg()).unwrap_or_else(|_| "\"\"".into()),
         serde_json::to_string(&theme.css_fg()).unwrap_or_else(|_| "\"\"".into()),
     );
-    let _ = window.eval(js.as_str());
+    // The title bar is drawn by the shell webview, so the script goes there --
+    // not into the dsh child webview, which is a different origin entirely.
+    if let Some(shell) = app.get_webview("main") {
+        let _ = shell.eval(js.as_str());
+    }
 
     #[cfg(windows)]
-    theme_titlebar(window, theme);
+    if let Some(window) = main_window(app) {
+        theme_titlebar(&window, theme);
+    }
 }
 
 /// Tint the window's border and dark-mode flag to match the page.
@@ -216,7 +233,7 @@ fn apply_theme(window: &tauri::WebviewWindow, theme: Theme) {
 /// 22000+); on Windows 10 they fail harmlessly and only the dark-mode flag
 /// takes effect. That limitation is exactly why the title bar is self-drawn.
 #[cfg(windows)]
-fn theme_titlebar(window: &tauri::WebviewWindow, theme: Theme) {
+fn theme_titlebar(window: &tauri::Window, theme: Theme) {
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -262,9 +279,9 @@ fn theme_titlebar(window: &tauri::WebviewWindow, theme: Theme) {
     }
 }
 
-/// Injected into every frame the webview loads, including the dsh GUI running
-/// inside our shell's iframe. Reports dsh's sidebar colour to the Rust host via
-/// the `dsh-theme` event so the self-drawn title bar sits flush with it.
+/// Injected into the dsh GUI webview only. Reports dsh's sidebar colour to the
+/// Rust host via the `dsh-theme` event so the self-drawn title bar sits flush
+/// with it.
 ///
 /// Reads dsh's own design token, `--dsw-specific-sidebar-fill`, rather than
 /// sampling pixels: the token is what dsh itself paints the sidebar with, so a
@@ -273,24 +290,18 @@ fn theme_titlebar(window: &tauri::WebviewWindow, theme: Theme) {
 /// a fallback for a theme that drops the token entirely.
 const THEME_WATCH_JS: &str = r#"
 (function () {
-  // Only the dsh page reports, and it lives one level down in the shell's
-  // iframe. Two frames run this script:
+  // Only the dsh page itself reports. It used to live in the shell's iframe, so
+  // this guard read `window.top === window` as "I am the shell" and returned;
+  // dsh is now a child webview, i.e. its own top-level document, so that test
+  // would skip the one frame we want. The script is no longer injected into the
+  // shell webview at all, which leaves exactly one thing to exclude here:
+  // frames dsh opens itself. A nested frame reporting would fight the real page
+  // over the title bar colour.
   //
-  //   shell  (top-level, our index.html) -- has no dsh tokens to read, so its
-  //          reading is meaningless; it is the thing being coloured.
-  //   dsh    (first-level subframe)      -- the one we actually want.
-  //
-  // Skip anything deeper than one level too: dsh may frame things itself, and a
-  // nested frame reporting would fight the real page over the title bar colour.
-  //
-  // This was `window.top !== window && !document.body`, which was inverted. The
-  // script is injected at document-start, so `document.body` is null in *both*
-  // frames; the shell fell through and reported (finding no token, and sampling
-  // the iframe element's own background back), while dsh returned early and
-  // never reported at all. The bar then sat on the hardcoded default forever --
-  // which happens to match dsh's dark theme, so it looked correct until you
-  // switched to light.
-  if (window.top === window || window.parent !== window.top) return;
+  // Kept as an all-frames injection on purpose: Windows adds initialization
+  // scripts to subframes regardless of the main-frame-only flag, so the guard is
+  // what actually does the excluding.
+  if (window.top !== window) return;
 
   function parseRgb(v) {
     if (!v) return null;
@@ -361,9 +372,12 @@ const THEME_WATCH_JS: &str = r#"
 
   function markTitle(t) {
     // Fallback channel for when the event bridge is unusable: encode the
-    // colours into document.title as [dsh:RRGGBB:RRGGBB]. The host polls it,
-    // applies them, then strips the marker. Only rewrite on an actual change,
-    // otherwise we fight the host for the title every tick.
+    // colours into document.title as [dsh:RRGGBB:RRGGBB]. The host watches this
+    // webview's title changes (on_document_title_changed) and applies them.
+    // Nothing strips the marker afterwards and nothing needs to: this is a child
+    // webview, so its document title is never the window's -- it does not reach
+    // the taskbar. Only rewrite on an actual change, otherwise we fight
+    // ourselves for the title every tick.
     var enc = hex(t.bg[0]) + hex(t.bg[1]) + hex(t.bg[2]) + ':' +
       hex(t.fg[0]) + hex(t.fg[1]) + hex(t.fg[2]);
     if (lastMarked === enc) return;
@@ -375,6 +389,9 @@ const THEME_WATCH_JS: &str = r#"
   }
 
   function report() {
+    // A page that failed to load has nothing worth matching, and LOAD_WATCH_JS
+    // may be using the title to say so -- see __dshFaulted there.
+    if (window.__dshFaulted) return;
     var t = readTheme();
     if (!eventBroken) {
       try {
@@ -418,6 +435,234 @@ const THEME_WATCH_JS: &str = r#"
 })();
 "#;
 
+/// Injected alongside `THEME_WATCH_JS` into the dsh webview. Reports a page that
+/// is not the GUI back to the host over `dsh-gui-fault`.
+///
+/// Why this exists: the webview fills the whole content area and has no chrome
+/// of its own, so whatever the backend answers with *is* the window. When dsh
+/// refused the request (`401 dsh web authentication required; reopen the URL
+/// printed by dsh web.`), the shell had already reported `ready` and hidden
+/// every view of its own -- so one line of English plain text, top-left on a
+/// white page, was the entire UI. Nothing said which program had failed, or that
+/// the retry button was one hidden view away.
+///
+/// The test is deliberately narrow: a body whose only element is a single `<pre>`
+/// is how Chromium renders `text/plain`, which the GUI's own HTML never is. So a
+/// dsh that boots normally cannot trip this, while any plain-text error response
+/// -- this 401, or whatever the next one turns out to be -- surfaces with its
+/// text intact.
+const LOAD_WATCH_JS: &str = r#"
+(function () {
+  if (window.top !== window) return;
+
+  function fault() {
+    // text/plain in Chromium is <body><pre>…</pre></body>. Anything with more
+    // structure than that is a real page and none of our business.
+    var body = document.body;
+    if (!body || body.children.length !== 1) return null;
+    var only = body.children[0];
+    if (only.tagName !== 'PRE') return null;
+    var text = (only.textContent || '').trim();
+    return text ? text.slice(0, 400) : null;
+  }
+
+  // Fallback channel, same trick as markTitle in THEME_WATCH_JS: the host is
+  // watching this webview's title changes anyway, and a title change needs no
+  // capability at all. Worth having twice over here -- if this report is the
+  // thing that goes missing, we are back to the bug this whole path exists to
+  // fix: an English error on a white page and no way to retry.
+  function markTitle(text) {
+    try {
+      document.title = '[dsh-fault]' + text;
+    } catch (e) {}
+  }
+
+  function check() {
+    var f = fault();
+    if (!f) return;
+    // Stops the theme sampler: it shares this document, and letting it go on
+    // reporting would both fight us for the title and describe a page that is
+    // about to be taken off screen.
+    window.__dshFaulted = true;
+    try {
+      var p = window.__TAURI__ && window.__TAURI__.event &&
+        window.__TAURI__.event.emit('dsh-gui-fault', { text: f });
+      if (p) {
+        // A capability rejection arrives as a rejected promise, not a throw.
+        if (p.catch) p.catch(function () { markTitle(f); });
+        return;
+      }
+    } catch (e) {}
+    markTitle(f); // no bridge on this page at all
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', check);
+  } else {
+    check();
+  }
+})();
+"#;
+
+/// Label of the child webview that hosts the dsh GUI.
+const GUI_LABEL: &str = "dsh-gui";
+
+/// Height of the shell's self-drawn title bar, in CSS pixels. The child webview
+/// starts below it. Must match `#titlebar { flex: 0 0 32px }` in ui/index.html:
+/// nothing enforces that at build time, so the two move together by hand.
+const TITLEBAR_H: f64 = 32.0;
+
+/// Commands for the thread that owns the dsh webview.
+///
+/// Everything reaches the webview through this channel rather than touching it
+/// directly, because `Window::add_child` dispatches to the main thread and then
+/// *blocks* on the reply -- calling it from the main thread (a sync command, an
+/// event handler) deadlocks. One dedicated worker means no caller has to know
+/// which thread it is on.
+enum GuiCmd {
+    /// Create the webview if needed, point it at this URL, and show it.
+    Mount(Url),
+    /// Take it off screen without discarding it: the page keeps running and its
+    /// state survives.
+    Hide,
+    /// Put it back, but only if the GUI is what should be on screen right now.
+    Show,
+    /// Re-fit it to the window (resize, DPI change).
+    Fit,
+}
+
+/// Sender half of the GUI worker's channel, kept in managed state.
+struct GuiHost(mpsc::Sender<GuiCmd>);
+
+/// Ask the GUI worker for something. A closed channel means the worker is gone,
+/// which only happens on shutdown — nothing to report.
+fn gui_send(app: &tauri::AppHandle, cmd: GuiCmd) {
+    if let Some(host) = app.try_state::<GuiHost>() {
+        let _ = host.0.send(cmd);
+    }
+}
+
+/// The main window.
+///
+/// `get_webview_window("main")` cannot be used anywhere in this app, and this
+/// exists to keep it out. That lookup ends in `Window::is_webview_window`, which
+/// is `self.webviews().all(|w| w.label() == self.label())` -- true only for a
+/// window whose sole webview is its namesake. The moment `spawn_gui_worker`
+/// adds the `dsh-gui` child, the main window holds two webviews and the
+/// predicate is false *forever*, so `get_webview_window("main")` returns `None`
+/// for the rest of the process. It fails silently: every `if let Some(w) = ...`
+/// simply stops running its body.
+///
+/// `get_window` is a plain lookup in the manager's map with no such predicate.
+fn main_window(app: &tauri::AppHandle) -> Option<tauri::Window> {
+    app.get_window("main")
+}
+
+/// Where the dsh webview sits inside the window: the full client area minus the
+/// title bar. Physical pixels, because that is what `inner_size` reports and
+/// mixing the two rounds badly at fractional scale factors.
+fn gui_bounds(window: &tauri::Window) -> Option<tauri::Rect> {
+    let size = window.inner_size().ok()?;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let bar = (TITLEBAR_H * scale).round() as u32;
+    Some(tauri::Rect {
+        position: PhysicalPosition::new(0_i32, bar as i32).into(),
+        // A window dragged shorter than the title bar would underflow to a
+        // gigantic webview; clamp instead.
+        size: PhysicalSize::new(size.width, size.height.saturating_sub(bar)).into(),
+    })
+}
+
+/// Run the GUI webview's owner thread.
+///
+/// The webview is created on first `Mount` rather than at startup: before the
+/// backend answers there is no URL to give it, and an empty one would flash a
+/// blank white rectangle over the boot splash.
+fn spawn_gui_worker(app: tauri::AppHandle) -> mpsc::Sender<GuiCmd> {
+    let (tx, rx) = mpsc::channel::<GuiCmd>();
+    std::thread::spawn(move || {
+        while let Ok(cmd) = rx.recv() {
+            let Some(window) = main_window(&app) else {
+                continue;
+            };
+            match cmd {
+                GuiCmd::Mount(url) => match app.get_webview(GUI_LABEL) {
+                    // Always navigate, even to the URL it is already on: this is
+                    // the retry path, and the page we are retrying past is a
+                    // failed load. dsh's launch token is matched per process
+                    // rather than consumed, so replaying the same tokened URL
+                    // mints the session cookie again.
+                    Some(gui) => {
+                        let _ = gui.navigate(url);
+                        if let Some(b) = gui_bounds(&window) {
+                            let _ = gui.set_bounds(b);
+                        }
+                        let _ = gui.show();
+                    }
+                    None => {
+                        let Some(b) = gui_bounds(&window) else {
+                            continue;
+                        };
+                        let builder = WebviewBuilder::new(GUI_LABEL, WebviewUrl::External(url))
+                            // The sampler and the fault detector both have to run
+                            // inside dsh's own document: the shell cannot read
+                            // across origins to find out what colour the page is,
+                            // or whether it loaded at all.
+                            .initialization_script_for_all_frames(THEME_WATCH_JS)
+                            .initialization_script_for_all_frames(LOAD_WATCH_JS)
+                            // Fallback channel for both injected scripts: a title
+                            // change reaches us without needing a capability, so
+                            // whichever of them finds the event bridge unusable can
+                            // still be heard. See markTitle in each.
+                            .on_document_title_changed({
+                                let app = app.clone();
+                                move |_webview, title| {
+                                    // Faults first: a page reporting one is not a
+                                    // page whose colours we want.
+                                    if let Some(text) = parse_fault_marker(&title) {
+                                        report_gui_fault(&app, text);
+                                    } else if let Some((theme, _)) = parse_title_marker(&title) {
+                                        apply_theme(&app, theme);
+                                    }
+                                }
+                            })
+                            // Matches the shell's own background so a slow first
+                            // paint is not a white flash.
+                            .background_color((27, 27, 28, 255).into());
+                        match window.add_child(builder, b.position, b.size) {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("failed to create dsh webview: {e}"),
+                        }
+                    }
+                },
+                GuiCmd::Hide => {
+                    if let Some(gui) = app.get_webview(GUI_LABEL) {
+                        let _ = gui.hide();
+                    }
+                }
+                GuiCmd::Show => {
+                    // Guarded rather than unconditional: the shell asks for this
+                    // when the update panel closes, and by then the backend may
+                    // have died and put an error view underneath.
+                    if gui_is_up(&app) {
+                        if let Some(gui) = app.get_webview(GUI_LABEL) {
+                            let _ = gui.show();
+                        }
+                    }
+                }
+                GuiCmd::Fit => {
+                    if let Some(gui) = app.get_webview(GUI_LABEL) {
+                        if let Some(b) = gui_bounds(&window) {
+                            let _ = gui.set_bounds(b);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    tx
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -425,7 +670,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Second launch: focus the existing window (show it first in case
             // it was hidden to the tray).
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = main_window(app) {
                 let _ = window.show();
                 let _ = window.unminimize();
                 let _ = window.set_focus();
@@ -443,17 +688,23 @@ fn main() {
             install_dsh,
             upgrade_dsh,
             retry_boot,
-            open_node_site
+            open_node_site,
+            set_panel_open
         ])
         .setup(|app| {
             let handle = app.handle().clone();
             setup_tray(&handle)?;
 
-            // The window stays on our own shell page for its whole life: the
-            // shell draws the title bar, hosts the boot/guidance views, and
-            // later hosts the dsh GUI in an iframe. It is never navigated away,
-            // which is what lets the title bar be any colour -- a native caption
-            // cannot be tinted before Windows 11.
+            // The shell webview stays on our own page for its whole life: it
+            // draws the title bar and hosts the boot/guidance views and the
+            // update panel. It is never navigated away, which is what lets the
+            // title bar be any colour -- a native caption cannot be tinted
+            // before Windows 11.
+            //
+            // The dsh GUI is *not* in here. It gets a sibling child webview
+            // (`spawn_gui_worker`) covering everything below the title bar,
+            // because dsh's session cookie is `SameSite=Strict` and so only ever
+            // reaches a top-level document.
             //
             // decorations(false) removes the native caption. The replacement is
             // in ui/index.html, and the window control permissions it needs are
@@ -465,43 +716,61 @@ fn main() {
                     .min_inner_size(800.0, 600.0)
                     .center()
                     .decorations(false)
-                    // for_all_frames: the sampler has to run *inside* the
-                    // iframe, since the shell cannot read across origins into
-                    // the dsh page to find out what colour it is.
-                    .initialization_script_for_all_frames(THEME_WATCH_JS)
                     .build()
                     .map_err(|e| format!("failed to create main window: {e}"))?;
 
             // Relay colours from the dsh page to the shell's title bar.
+            //
+            // Ignored unless the GUI is what should be on screen. The sampler
+            // keeps ticking in a webview we have taken off screen -- including one
+            // sitting on an error response -- and a 401 renders as black on white,
+            // so without this guard a failed load would go on repainting the title
+            // bar to match a page nobody can see, over the shell's own dark error
+            // view.
             let theme_handle = handle.clone();
             let _ = handle.listen("dsh-theme", move |event| {
-                let theme = serde_json::from_str::<Theme>(event.payload()).unwrap_or_default();
-                if let Some(w) = theme_handle.get_webview_window("main") {
-                    apply_theme(&w, theme);
+                if !gui_is_up(&theme_handle) {
+                    return;
                 }
+                let theme = serde_json::from_str::<Theme>(event.payload()).unwrap_or_default();
+                apply_theme(&theme_handle, theme);
             });
 
             // Until the page reports in, assume dsh's dark theme.
-            apply_theme(&window, Theme::default());
+            apply_theme(&handle, Theme::default());
 
-            // Fallback channel: when the event bridge is unusable the injected
-            // script encodes the colours into document.title as
-            // [dsh:RRGGBB:RRGGBB]. Poll for that, apply it, then strip the
-            // marker so it never shows in the taskbar. The script only re-marks
-            // on an actual change, so this settles instead of looping.
-            let title_window = window.clone();
-            std::thread::spawn(move || loop {
-                let title = title_window.title().unwrap_or_default();
-                if let Some((theme, len)) = parse_title_marker(&title) {
-                    apply_theme(&title_window, theme);
-                    let _ = title_window.set_title(&title[len..]);
+            // The dsh webview reporting that it did not load the GUI. Turned into
+            // an ordinary error state so the shell's own error view -- with its
+            // retry button -- comes back over it, in Chinese, saying which
+            // program failed. See LOAD_WATCH_JS.
+            let fault_handle = handle.clone();
+            let _ = handle.listen("dsh-gui-fault", move |event| {
+                let text = serde_json::from_str::<serde_json::Value>(event.payload())
+                    .ok()
+                    .and_then(|v| v["text"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                report_gui_fault(&fault_handle, &text);
+            });
+
+            // The dsh GUI's own webview, and its owner thread. Created lazily on
+            // the first `Mount`; see spawn_gui_worker.
+            app.manage(GuiHost(spawn_gui_worker(handle.clone())));
+
+            // Keep it fitted to the content area. Tauri's own `auto_resize` would
+            // grow it to the whole window and swallow the title bar, so the
+            // offset is maintained here instead.
+            let fit_handle = handle.clone();
+            window.on_window_event(move |event| {
+                if matches!(
+                    event,
+                    WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
+                ) {
+                    gui_send(&fit_handle, GuiCmd::Fit);
                 }
-                std::thread::sleep(Duration::from_millis(800));
             });
 
             // The backend slot starts empty and is filled by boot_sequence once
-            // we actually own a child. It stays empty when we reuse a dsh we did
-            // not start (see try_boot): exiting must not kill the browser's dsh.
+            // we actually own a child.
             app.manage(Backend::default());
             app.manage(BootLock(AtomicBool::new(false)));
             app.manage(Status(Mutex::new(status_payload("booting", Vec::new()))));
@@ -530,7 +799,7 @@ fn main() {
                 ..
             } if label == "main" => {
                 api.prevent_close();
-                if let Some(window) = app_handle.get_webview_window("main") {
+                if let Some(window) = main_window(app_handle) {
                     let _ = window.hide();
                 }
             }
@@ -554,13 +823,94 @@ fn status_payload(state: &str, detail: Vec<String>) -> serde_json::Value {
 }
 
 /// Push a status to the boot page and remember it for `current_status`.
+///
+/// Also the one place that takes the dsh webview off screen. It is a sibling of
+/// the shell webview rather than an element inside it, so the shell cannot cover
+/// it by unhiding a view -- the host has to move it. Anything that is not
+/// `ready` means the shell has something of its own to show (splash, error,
+/// install log), so the GUI goes away; `show_gui` brings it back.
 fn emit_status(app: &tauri::AppHandle, state: &str, detail: Vec<String>) {
     eprintln!("boot status: {state}");
     let payload = status_payload(state, detail);
     if let Some(store) = app.try_state::<Status>() {
         *store.0.lock().unwrap() = payload.clone();
     }
+    if state != "ready" {
+        gui_send(app, GuiCmd::Hide);
+    }
     let _ = app.emit("dsh-status", payload);
+}
+
+/// The error lines shown when the dsh webview loaded something that is not the
+/// GUI. `text` is what the page actually said, already truncated by the detector.
+///
+/// The 401 gets named explicitly because it is the one failure the user can do
+/// nothing about from here and everything about by restarting: dsh mints a
+/// per-process launch token, so a stale tab, a resumed session, or a backend that
+/// was replaced underneath us all land on it.
+fn gui_fault_detail(text: &str) -> Vec<String> {
+    let mut lines = vec!["DeepSeek Harness 打开了，但返回的不是界面。".to_string()];
+    if text.contains("authentication required") {
+        lines.push(
+            "`dsh web` 拒绝了这次访问：它要求的登录凭据只对启动它的那次会话有效。\
+             点下面的重试，会重新启动一个后端并重新登录。"
+                .into(),
+        );
+    }
+    if !text.is_empty() {
+        lines.push(format!("后端原话：{text}"));
+    }
+    lines
+}
+
+/// Prefix the fault detector puts on `document.title` when it cannot use the
+/// event bridge. See `markTitle` in `LOAD_WATCH_JS`.
+const FAULT_MARKER: &str = "[dsh-fault]";
+
+/// The error text out of a fault-marked title, if that is what this title is.
+///
+/// Deliberately not a superset of `parse_title_marker`'s format: the two markers
+/// have to be told apart, because a theme report from a page that failed to load
+/// is worse than no report at all.
+fn parse_fault_marker(title: &str) -> Option<&str> {
+    title.strip_prefix(FAULT_MARKER)
+}
+
+/// Turn a failed GUI load into an ordinary error state, so the shell's own error
+/// view -- Chinese, with a retry button -- comes back over it.
+///
+/// Called from both of the detector's channels (the `dsh-gui-fault` event and the
+/// title fallback), which is why the theme reset lives here rather than in either.
+fn report_gui_fault(app: &tauri::AppHandle, text: &str) {
+    // Only worth acting on while the GUI is supposed to be what is on screen: any
+    // other state already has something more informative showing, and the title
+    // channel in particular can fire again long after we handled this.
+    if !gui_is_up(app) {
+        return;
+    }
+    emit_status(app, "error", gui_fault_detail(text));
+    // The theme sampler shares the faulted document and may already have reported
+    // its colours -- a 401 is black on white -- before we got here. Put the title
+    // bar back to dsh's dark default so it matches the error view now on screen.
+    apply_theme(app, Theme::default());
+}
+
+/// The shell asking us to move the dsh webview out of the way, or put it back.
+///
+/// The update panel is drawn by the shell webview, which is a *sibling* of the
+/// dsh one and painted underneath it -- so with the GUI up, opening the panel
+/// would have shown nothing at all. There is no z-index across webviews; the
+/// only way to put the shell's own UI in front is to take the GUI off screen.
+///
+/// Local origin only: capabilities without a `remote` block do not apply to
+/// remote pages, so the dsh page cannot reach this (Tauri rejects app commands
+/// from a remote origin unless a capability grants them explicitly).
+#[tauri::command]
+fn set_panel_open(app: tauri::AppHandle, open: bool) {
+    gui_send(
+        &app,
+        if open { GuiCmd::Hide } else { GuiCmd::Show },
+    );
 }
 
 /// The boot page asks for this on load, in case it missed the event.
@@ -571,13 +921,18 @@ fn current_status(app: tauri::AppHandle) -> serde_json::Value {
         .unwrap_or_else(|| status_payload("booting", Vec::new()))
 }
 
-/// Whether the backend now serving is one we started, as opposed to one we found
-/// already running on the probe port and reused.
+/// Whether the backend now serving is one we started.
 ///
 /// Decides two things that both hinge on it: whether we may replace the files it
 /// is executing from (`upgrade_dsh_now`), and whether stopping ours costs the user
 /// anything (the page's update confirmation). `try_boot` stores the child before
 /// it waits for the URL, so this is already true by the time the GUI is shown.
+///
+/// Since dsh 0.1.5 there is no longer a path that reuses somebody else's backend
+/// (its session cookie is minted from a per-process launch token we never see),
+/// so in practice this is true whenever a GUI is up. The "not ours" branches are
+/// kept: they are what stops us from killing a stranger's process, and the
+/// judgement they encode does not depend on today's inability to reuse one.
 fn backend_is_ours(app: &tauri::AppHandle) -> bool {
     app.try_state::<Backend>()
         .is_some_and(|s| s.child.lock().unwrap().is_some())
@@ -589,7 +944,7 @@ fn backend_is_ours(app: &tauri::AppHandle) -> bool {
 /// Used to decide whether an error may take over the content area. Replacing a
 /// working GUI (possibly with a session in it) with an error page is a heavy
 /// answer to "the update check failed"; when the GUI is up, the update panel
-/// reports the failure itself and the iframe is left alone.
+/// reports the failure itself and the GUI webview is left alone.
 fn gui_is_up(app: &tauri::AppHandle) -> bool {
     app.try_state::<Status>()
         .map(|s| s.0.lock().unwrap()["state"] == "ready")
@@ -1030,16 +1385,6 @@ fn check_dsh_update(app: tauri::AppHandle, channel: String) {
 
 /// The boot sequence proper. `Err` carries lines to show the user verbatim.
 fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
-    // If a dsh web is already serving on the probe port (e.g. the browser tab's
-    // instance), reuse it instead of launching our own. This avoids the
-    // task-board single-instance lock colliding with the browser instance. We
-    // leave Backend empty: we do not own that backend, and exiting the desktop
-    // app must not kill it.
-    if let Some(existing) = probe_existing_web() {
-        show_gui(app, &existing);
-        return Ok(());
-    }
-
     // Nothing to start if the command is missing. Report it on the page instead
     // of dying silently — previously this path just exited after a ~6s flash of
     // an empty window, with the shell's "command not found" going nowhere.
@@ -1066,12 +1411,33 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
     // the wording matters. Say "starting" only once it is true.
     emit_status(app, "booting", vec!["正在启动 DeepSeek Harness…".into()]);
 
+    // A retry after a failed start may still be holding a dead (or dying) child.
+    // Before the lock check, not after: our own backend holds that lock, and
+    // asking whether somebody else has it is only meaningful once ours is gone.
+    take_backend(app);
+
     // A backend we killed on a previous exit never got to release the task-board
     // ledger lock; drop it now or the plugin tree refuses to load. See
     // clear_stale_task_board_lock.
-    clear_stale_task_board_lock();
-    // A retry after a failed start may still be holding a dead (or dying) child.
-    take_backend(app);
+    //
+    // A lock still held by a live process is somebody else's `dsh` -- a browser
+    // tab, or a terminal running the CLI. Two of them cannot share the workspace,
+    // so the spawn below would start, fail on the ledger, and report itself as a
+    // crash. Say what is actually wrong instead.
+    //
+    // This replaces probing 127.0.0.1:3080 for a dsh to reuse. Reuse is no longer
+    // possible at all: authenticating against a backend means replaying the
+    // launch token it printed on *its* stdout, which we never saw. The lock is
+    // also the better signal -- it finds a dsh on any port, and it is the thing
+    // that would actually have collided.
+    if clear_stale_task_board_lock() {
+        return Err(vec![
+            "另一个 dsh 正在使用同一个工作区。".into(),
+            "task-board 的账本锁还被那个进程占着，同一个工作区没法开两个 dsh。\
+             请先关掉浏览器里的 `dsh web` 或终端里的 dsh，再点重试。"
+                .into(),
+        ]);
+    }
 
     let mut spawned = spawn_backend().map_err(|e| vec![format!("无法启动 `dsh web`：{e}")])?;
     let stderr = spawned.stderr.take();
@@ -1141,17 +1507,18 @@ fn try_boot(app: &tauri::AppHandle) -> Result<(), Vec<String>> {
         let _ = url_tx.send(String::new());
     });
 
-    // Wait (bounded) for the backend URL, then hand it to the shell's iframe.
+    // Wait (bounded) for the backend URL, then hand it to the GUI webview.
     match url_rx.recv_timeout(BACKEND_READY_TIMEOUT) {
         Ok(url) if !url.is_empty() => {
             show_gui(app, &url);
             // Watch for the backend dying under us. This used to call exit(0),
             // on the reasoning that the window must not sit on a dead page --
             // which was the only option back when the window navigated *to* the
-            // backend: there was no page of ours left to report on. Now the
-            // window never leaves the shell, so we can hide the iframe and show
-            // the error view with its retry button instead of vanishing
-            // mid-session, which is the worst thing a desktop app can do.
+            // backend: there was no page of ours left to report on. The shell
+            // webview never leaves our own page, so we can take the GUI off
+            // screen and show the error view with its retry button instead of
+            // vanishing mid-session, which is the worst thing a desktop app can
+            // do.
             let app = app.clone();
             let log_file = log_file.clone();
             std::thread::spawn(move || {
@@ -1218,15 +1585,21 @@ fn wait_for_backend_exit(rx: &mpsc::Receiver<String>) -> bool {
     }
 }
 
-/// Point the shell's iframe at the backend GUI.
+/// Put the backend GUI on screen in its own child webview.
 ///
-/// The window itself is never navigated: it has to stay on our page so the
-/// self-drawn title bar survives. Retried because the backend can be ready
-/// before the shell has finished loading and `eval` cannot report whether the
-/// handler existed yet; `__dshSetFrame` is idempotent.
+/// The shell webview is never navigated: it has to stay on our page so the
+/// self-drawn title bar survives. The GUI used to be an iframe inside it, which
+/// stopped working when dsh started authenticating the browser with a
+/// `SameSite=Strict` cookie -- by definition never sent from a cross-site frame,
+/// and `http://tauri.localhost` is cross-site to `http://127.0.0.1:<port>`. So
+/// the URL exchange was performed, the cookie was refused, and dsh answered the
+/// follow-up request with `401 dsh web authentication required`.
+///
+/// A sibling webview is a top-level browsing context of its own, so the cookie is
+/// first-party and the whole question goes away. `url` keeps the `?token=` query
+/// dsh printed: navigating to it is what mints the session cookie.
 fn show_gui(app: &tauri::AppHandle, url: &str) {
-    // Validate before handing it to the page: `probe_existing_web` builds its
-    // URL from a port number, but the spawned backend's comes out of parsed
+    // Validate before handing it over: the URL comes out of parsed backend
     // stdout, so this is the boundary where a malformed one should stop.
     let parsed = match Url::parse(url) {
         Ok(p) => p,
@@ -1235,17 +1608,14 @@ fn show_gui(app: &tauri::AppHandle, url: &str) {
             return;
         }
     };
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    // Cache it as the current status too. The window no longer navigates, so
-    // the shell page can be reloaded while the GUI is up; without this it would
-    // ask for the status, be told "booting", and sit on the splash forever.
+    // Cache it as the current status too. The shell page can be reloaded while
+    // the GUI is up; without this it would ask for the status, be told
+    // "booting", and sit on the splash forever.
     //
     // The second element says whether this backend is ours. The update panel needs
     // it to be accurate about what an update costs: stopping ours interrupts
-    // whatever it was doing, while a reused one in a browser tab is untouched by a
-    // shell restart and refuses a dsh upgrade outright.
+    // whatever it was doing, while one we do not own is untouched by a shell
+    // restart and refuses a dsh upgrade outright.
     emit_status(
         app,
         "ready",
@@ -1259,16 +1629,10 @@ fn show_gui(app: &tauri::AppHandle, url: &str) {
         ],
     );
 
-    let js = format!(
-        "window.__dshSetFrame && window.__dshSetFrame({})",
-        serde_json::to_string(parsed.as_str()).unwrap_or_else(|_| "\"\"".into()),
-    );
-    for attempt in 0..6 {
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_millis(350));
-        }
-        let _ = window.eval(js.as_str());
-    }
+    // After the status, not before: the worker's `Show` path checks it, and
+    // `Mount` is the only thing that may run while the state still says
+    // otherwise.
+    gui_send(app, GuiCmd::Mount(parsed));
 }
 
 /// Parse the `[dsh:RRGGBB:RRGGBB]` prefix the injected script writes into
@@ -1819,9 +2183,9 @@ fn upgrade_dsh_to(app: &tauri::AppHandle, channel: &'static str) {
             };
             report_dsh_version(app, &other);
             // The panel's own row now carries this, so only take over the content
-            // area when there is no GUI to take it over from. Killing a running
-            // session's iframe to announce that a version lookup failed is the
-            // wrong trade.
+            // area when there is no GUI to take it over from. Hiding a running
+            // session to announce that a version lookup failed is the wrong
+            // trade.
             if !gui_is_up(app) {
                 emit_status(app, "error", vec![detail]);
             }
@@ -1842,20 +2206,27 @@ fn upgrade_dsh_now(
     target: &str,
     relation: VersionRelation,
 ) {
-    // A backend we do not own (a `dsh web` already serving in a browser tab) is
-    // still holding the old files open, and we have no business killing somebody
-    // else's process. Refuse rather than corrupting their install.
+    // A dsh we do not own (a `dsh web` serving in a browser tab, or the CLI in a
+    // terminal) is still holding the old files open, and we have no business
+    // killing somebody else's process. Refuse rather than corrupting their
+    // install.
+    //
+    // The ledger lock is the signal, read-only: `ours` being false means we have
+    // no child of our own, so a live owner can only be somebody else's. This used
+    // to probe port 3080 for a serving GUI, which found only a `dsh web` on that
+    // one port and now cannot even authenticate against it.
     let ours = backend_is_ours(app);
-    if !ours && probe_existing_web().is_some() {
-        emit_status(
-            app,
-            "error",
-            vec![format!(
-                "另一个 `dsh web` 正在运行（端口 {}），它占用着要被替换的文件。请先关掉它，再回来更新。",
-                probe_port()
-            )],
-        );
-        return;
+    if !ours {
+        if let Some(pid) = task_board_lock_owner() {
+            emit_status(
+                app,
+                "error",
+                vec![format!(
+                    "另一个 dsh 正在运行（进程 {pid}），它占用着要被替换的文件。请先关掉它，再回来更新。"
+                )],
+            );
+            return;
+        }
     }
 
     let down = relation == VersionRelation::Older;
@@ -2039,7 +2410,7 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = main_window(app) {
                     let _ = window.show();
                     let _ = window.unminimize();
                     let _ = window.set_focus();
@@ -2067,7 +2438,7 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             } = event
             {
                 let app = tray.app_handle();
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = main_window(app) {
                     let _ = window.show();
                     let _ = window.unminimize();
                     let _ = window.set_focus();
@@ -2432,7 +2803,7 @@ fn check_dsh_update_interactive(app: &tauri::AppHandle) {
                     }
                     // Bring the window up: the upgrade takes over the content area
                     // to stream npm's log, which is no use behind the tray.
-                    if let Some(w) = handle.get_webview_window("main") {
+                    if let Some(w) = main_window(&handle) {
                         let _ = w.show();
                         let _ = w.unminimize();
                         let _ = w.set_focus();
@@ -2467,39 +2838,6 @@ struct Spawned {
     child: Child,
     reader: BufReader<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
-}
-
-/// Port to probe for an already-running `dsh web`. Overridable via the
-/// `DSH_DESKTOP_PROBE_PORT` environment variable.
-fn probe_port() -> u16 {
-    std::env::var("DSH_DESKTOP_PROBE_PORT")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(3080)
-}
-
-/// Check whether a dsh web GUI is already serving on the probe port. If so,
-/// return its URL to reuse; otherwise None (we will launch our own backend).
-fn probe_existing_web() -> Option<String> {
-    use std::io::{Read, Write};
-
-    let port = probe_port();
-    let addr = format!("127.0.0.1:{port}");
-    let mut stream =
-        TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(1200)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
-    let _ = write!(
-        stream,
-        "GET / HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    );
-    let mut buf = String::new();
-    let _ = stream.read_to_string(&mut buf);
-    // A dsh web page titles itself "DeepSeek Harness".
-    if buf.contains("<title>DeepSeek Harness") || buf.contains("window.__DSH_BOOT__") {
-        Some(format!("http://127.0.0.1:{port}"))
-    } else {
-        None
-    }
 }
 
 /// Launch `dsh web --port 0` (OS picks a free port) from the user's home
@@ -2585,34 +2923,61 @@ fn dsh_home() -> PathBuf {
     dirs_home().join(".dsh")
 }
 
-/// Drop a stale `task-board` ledger lock left behind by a backend that died
-/// without releasing it — a crash, or a shutdown we had to force past the grace
-/// period in `kill_process_tree`, either of which skips node's cleanup hook.
+/// Path of the `task-board` ledger lock. Held for as long as a dsh is using the
+/// workspace, and the reason two of them cannot share one.
+fn task_board_lock_path() -> PathBuf {
+    dsh_home().join("task-board").join("ledger-v2.lock")
+}
+
+/// PID recorded in the ledger lock, if it is a live node process — i.e. a dsh
+/// that is genuinely using this workspace right now.
 ///
 /// The plugin guards the lock with a bare liveness check on the recorded PID,
 /// which the OS is free to reassign to an unrelated process — once it does, the
-/// lock looks permanently held and `dsh web` refuses to boot. So we only clear
-/// the lock when the recorded PID is *not* a live node process; a genuinely
-/// running backend (e.g. the browser tab's dsh) keeps its lock untouched.
-fn clear_stale_task_board_lock() {
-    let lock = dsh_home().join("task-board").join("ledger-v2.lock");
-    let Ok(raw) = std::fs::read_to_string(&lock) else {
-        return; // no lock, nothing to do
-    };
-
+/// lock looks permanently held and `dsh web` refuses to boot. Hence the identity
+/// check the plugin skips: a PID that is not a live *node* process cannot be the
+/// owning backend, and an unreadable or PID-less lock is junk by definition.
+fn task_board_lock_owner() -> Option<u64> {
+    let raw = std::fs::read_to_string(task_board_lock_path()).ok()?;
     let pid = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
-        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()));
+        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))?;
+    node_process_alive(pid).then_some(pid)
+}
 
-    // Unreadable/PID-less lock is junk by definition; a PID that is not a live
-    // node process cannot be the owning backend.
-    match pid {
-        Some(pid) if node_process_alive(pid) => return,
-        _ => {}
-    }
-
-    if std::fs::remove_file(&lock).is_ok() {
-        eprintln!("cleared stale task-board lock: {}", lock.display());
+/// Drop a stale `task-board` ledger lock left behind by a backend that died
+/// without releasing it — a crash, or a shutdown we had to force past the grace
+/// period in `kill_process_tree`, either of which skips node's cleanup hook. A
+/// lock a live dsh still owns (the browser tab's) is left untouched.
+///
+/// Returns whether the lock is still held by a live process, i.e. whether some
+/// other dsh is using this workspace right now. Callers that only want the
+/// cleanup can ignore it.
+fn clear_stale_task_board_lock() -> bool {
+    // Polled rather than checked once: on Windows `taskkill /T /F` returns before
+    // the tree is reaped, so a backend we killed a moment ago can still look
+    // alive. Without the wait, a retry would report our own dying child as
+    // somebody else's dsh.
+    let deadline = Instant::now() + LOCK_RELEASE_GRACE;
+    loop {
+        match task_board_lock_owner() {
+            Some(pid) => {
+                if Instant::now() >= deadline {
+                    eprintln!("task-board lock held by live pid {pid}");
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            None => {
+                let lock = task_board_lock_path();
+                // Nothing to remove when there was no lock in the first place;
+                // `remove_file` failing on a missing file is the ordinary case.
+                if lock.exists() && std::fs::remove_file(&lock).is_ok() {
+                    eprintln!("cleared stale task-board lock: {}", lock.display());
+                }
+                return false;
+            }
+        }
     }
 }
 
@@ -3051,6 +3416,47 @@ mod tests {
         assert!(parse_title_marker("[dsh:0f111:e2e8f0]x").is_none()); // short hex
         assert!(parse_title_marker("[dsh:zzzzzz:e2e8f0]x").is_none()); // not hex
         assert!(parse_title_marker("[dsh:0f1115:e2e8f0").is_none()); // unterminated
+    }
+
+    #[test]
+    fn reads_a_fault_marker_off_a_title() {
+        assert_eq!(
+            parse_fault_marker("[dsh-fault]dsh web authentication required"),
+            Some("dsh web authentication required")
+        );
+        // Empty text still counts as a fault: it says the page was plain text,
+        // which is enough to raise the error view.
+        assert_eq!(parse_fault_marker("[dsh-fault]"), Some(""));
+    }
+
+    #[test]
+    fn keeps_the_two_title_markers_apart() {
+        // The dispatch in on_document_title_changed depends on this: a fault must
+        // not parse as a theme, or a failed load would repaint the title bar to
+        // match the error page instead of raising the error view.
+        assert!(parse_fault_marker("[dsh:0f1115:e2e8f0]DeepSeek Harness").is_none());
+        assert!(parse_title_marker("[dsh-fault]401").is_none());
+        assert!(parse_fault_marker("DeepSeek Harness").is_none());
+    }
+
+    #[test]
+    fn names_the_401_in_the_fault_detail() {
+        let lines = gui_fault_detail("dsh web authentication required; reopen the URL");
+        // Three parts, in this order: what happened, what it means, what dsh said.
+        // The middle one is the whole point -- the raw English line on its own was
+        // the bug being fixed.
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("重试"), "must tell the user what to do");
+        assert!(lines[2].contains("authentication required"));
+    }
+
+    #[test]
+    fn keeps_an_unrecognized_fault_readable() {
+        // Any other plain-text response: no interpretation to offer, but the text
+        // itself still has to reach the user.
+        let lines = gui_fault_detail("502 Bad Gateway");
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("502 Bad Gateway"));
     }
 
     #[test]

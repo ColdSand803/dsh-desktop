@@ -19,10 +19,13 @@ launches `dsh web` as a subprocess; it does not bundle or modify it.
 Worth knowing before you audit it, and worth knowing as a user:
 
 - **Runs a local HTTP server.** `dsh web --port 0` is spawned as a child process
-  and bound to loopback. The desktop window loads it in an iframe. On startup the
-  app also probes `127.0.0.1:3080` and will **reuse** a `dsh web` already serving
-  there rather than starting its own — so a process you did not start can end up
-  displayed in this window. Override the probe port with `DSH_DESKTOP_PROBE_PORT`.
+  and bound to loopback. The desktop window shows it in a second, sibling webview
+  rather than an iframe — dsh authenticates the browser with a `SameSite=Strict`
+  cookie, which no browser sends from a cross-site frame. The app always starts its
+  own backend: authenticating against an existing one would mean replaying a launch
+  token printed on *its* stdout, which this app never saw, so the former
+  `127.0.0.1:3080` probe and its reuse path are gone. A `dsh` already using the same
+  workspace is detected through the task-board ledger lock and reported instead.
 - **Installs software on request.** The guided install runs
   `npm install -g @deepseek-ai/dsh` when you click the button. The package name is
   a Rust-side constant and the IPC command takes no arguments, so the page cannot
@@ -34,7 +37,10 @@ Worth knowing before you audit it, and worth knowing as a user:
   `core:default` plus the window controls its self-drawn title bar needs. The dsh
   origin, which renders model output, gets `core:event:allow-emit` and nothing
   else (`src-tauri/capabilities/remote-theme.json`) — no window control, no path
-  or app APIs.
+  or app APIs. That split is enforced by *webview* scope, not window scope: both
+  webviews live in the same window, and Tauri resolves a capability if either its
+  `windows` or its `webviews` list matches — so widening `default.json` to
+  `"windows": ["main"]` would silently hand `core:default` to the dsh origin.
 - **Force-kills the backend tree on exit** (`taskkill /T /F` on Windows) and
   confines it to a Job Object so it cannot outlive the app. See the known
   limitation about plugin-install corruption in the README.

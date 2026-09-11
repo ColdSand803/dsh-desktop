@@ -5,7 +5,7 @@
 A desktop client for [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)
 (`dsh`). It wraps `dsh web` into a native Windows app using [Tauri v2](https://tauri.app).
 
-> **Status:** works, but young. Only `0.1.0` exists, and `dsh` itself is a
+> **Status:** works, but young. The newest release is `0.1.2`, and `dsh` itself is a
 > developer preview whose output format this app parses — see
 > [Known limitations](#known-limitations).
 
@@ -18,8 +18,11 @@ A desktop client for [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-
   `dsh`, the window stays on a guidance page offering a one-click
   `npm i -g @deepseek-ai/dsh` with a live log, then boots straight in. With no npm
   either, it points you at nodejs.org.
-- **Reuses a running backend.** If a `dsh web` is already serving on port 3080 —
-  your browser tab, say — the app displays that instead of starting a second one.
+- **Says so when the backend answers with an error.** The GUI fills the window and
+  has no chrome of its own, so a plain-text failure from `dsh web` would otherwise
+  *be* the whole UI — one line of English on a white page. A detector catches that
+  and swaps in the shell's own error view, with the backend's text and a retry
+  button.
 - **Lives in the tray.** Closing the window hides it; the backend keeps running.
   Quit from the tray menu to shut everything down.
 - **No console flash.** Every subprocess is spawned with `CREATE_NO_WINDOW`.
@@ -61,19 +64,27 @@ Regenerating icons and cutting a release are covered in
 
 ## How it works
 
-The window never navigates. It stays on the bundled shell page (`ui/index.html`)
-for its whole life: the shell draws the title bar and hosts the dsh GUI in an
-iframe. That is what allows the title bar to be any colour — a native caption
-cannot be tinted before Windows 11, and this app targets Win10 too. The sampling
-script is injected into every frame, since the shell cannot read across origins
-into the dsh page; the reasoning is in the comments around `THEME_WATCH_JS` in
-`src-tauri/src/main.rs`.
+The shell webview never navigates. It stays on the bundled page (`ui/index.html`)
+for its whole life and draws the title bar there — that is what allows the bar to
+be any colour, since a native caption cannot be tinted before Windows 11 and this
+app targets Win10 too. The dsh GUI is a **second, sibling webview** in the same
+window, fitted below the bar and moved out of the way when the update panel opens.
+
+It has to be a sibling rather than an iframe: since dsh `0.1.5` the backend
+authenticates the browser with a `SameSite=Strict` cookie, which no browser will
+ever send from a cross-site frame, so the iframe host got `401 dsh web
+authentication required` on every request. A child webview is its own top-level
+browsing context, so the cookie is first-party. The theme sampling script runs in
+that webview and reports back over an emit-only channel; the reasoning is in the
+comments around `THEME_WATCH_JS` and `show_gui` in `src-tauri/src/main.rs`.
 
 The backend is spawned as `dsh web --port 0 --no-open` from your home directory
-(override with `DSH_DESKTOP_WORKDIR`), and its stdout is parsed for the local URL.
-Startup first probes port 3080 (`DSH_DESKTOP_PROBE_PORT`) and reuses a `dsh web`
-already serving there — in which case quitting this app leaves that backend
-running, because it is not ours to kill.
+(override with `DSH_DESKTOP_WORKDIR`), and its stdout is parsed for the local URL —
+query string included, since the `?token=` on it is what mints the session cookie.
+The app always starts its own: authenticating against a backend somebody else
+launched would mean replaying the token printed on *its* stdout, which this app
+never saw. A `dsh` already using the same workspace is detected through the
+task-board ledger lock instead, and reported rather than fought over.
 
 Behaviour worth knowing as a user: closing the window hides it to the tray and the
 backend keeps serving, so quit from the tray menu to actually stop. The backend log

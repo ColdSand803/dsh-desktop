@@ -13,7 +13,11 @@ rust-version = "1.77"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# `unstable`: multi-webview (Window::add_child / WebviewBuilder). The dsh GUI has
+# to be its own *top-level* browsing context, not an iframe -- since 0.1.5 dsh
+# authenticates the browser with a `SameSite=Strict` cookie, which no browser
+# will ever send from a cross-site frame. See `mount_gui` in src/main.rs.
+tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
