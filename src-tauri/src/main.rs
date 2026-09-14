@@ -907,10 +907,7 @@ fn report_gui_fault(app: &tauri::AppHandle, text: &str) {
 /// from a remote origin unless a capability grants them explicitly).
 #[tauri::command]
 fn set_panel_open(app: tauri::AppHandle, open: bool) {
-    gui_send(
-        &app,
-        if open { GuiCmd::Hide } else { GuiCmd::Show },
-    );
+    gui_send(&app, if open { GuiCmd::Hide } else { GuiCmd::Show });
 }
 
 /// The boot page asks for this on load, in case it missed the event.
